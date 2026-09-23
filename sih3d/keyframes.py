@@ -49,7 +49,12 @@ def _laplacian_variance_batch(frames: "torch.Tensor", downscale: int = 4) -> "to
     if downscale > 1:
         gray = F.avg_pool2d(gray, kernel_size=downscale, stride=downscale)
     kernel = torch.tensor(_LAPLACIAN_KERNEL, dtype=gray.dtype, device=gray.device).view(1, 1, 3, 3)
-    lap = F.conv2d(gray, kernel, padding=1)
+    # Replicate-pad (not conv2d's default zero-pad) so a real image doesn't
+    # get a fake high-frequency edge at the border from an artificial jump
+    # to 0 — that would otherwise dominate the variance on a small
+    # downsampled grid and inflate scores for flat/dark-bordered frames.
+    gray_padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+    lap = F.conv2d(gray_padded, kernel, padding=0)
     return lap.var(dim=(1, 2, 3))
 
 
