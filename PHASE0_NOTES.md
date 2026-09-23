@@ -359,3 +359,86 @@ itself pin torch** on an actual Kaggle session before trusting this conclusion f
    doesn't already do something incompatible with that assumption).
 3. `uniception==0.1.7`'s own dependency footprint (possible transitive torch pin) —
    untraced.
+
+---
+
+## 9. Design change — Backbone B now bypasses SLRF entirely (post-review decision)
+
+Per direction after this initial research: drop GeoFF3D's SLRF orchestration for Backbone
+B too. Rationale (confirmed by re-reading `geoff3d/models/external/pi3x/__init__.py` in
+full): the raw `Pi3X` model class (`geoff3d/models/external/pi3/models/pi3x.py`,
+Apache-2.0, Meta copyright header) is a **complete, self-contained, vendorable
+`nn.Module` + `PyTorchModelHubMixin`** with a clean `forward(imgs, intrinsics=None,
+poses=None, pose_mask=None, with_prior=None, overall_prob=1.0, ray_dirs_prob=0.0,
+depth_prob=0.0, cam_prob=0.0)` signature (docstring read in full, pi3x.py:283-354).
+`Pi3XWrapper` (the SLRF-facing class) does nothing but stack view dicts and forward
+scalar probabilities into this same call — it's pure plumbing, not model logic, and
+its `load_pretrained_weights=false` footgun (§6 above) only exists inside that plumbing.
+
+**Vendored**: `sih3d/vendor/pi3/` + `sih3d/vendor/dinov2/` (168K + 108K), copied from the
+GeoFF3D clone, `geoff3d.models.external.*` import paths mechanically rewritten to
+`sih3d.vendor.*`. Removed `pi3/models/geoff3d.py` (GeoFF3D-specific, not needed) and
+three training-only `dinov2/utils/*.py` files with stray absolute `dinov2.*` imports
+that aren't on the inference path (`dinov2.hub.backbones` → `dinov2.hub.utils`, both
+clean). See `sih3d/vendor/NOTICE.md` for the full attribution/rationale.
+
+**Verified locally (CPU, torch 2.14.0, no GPU/download needed — random-init weights,
+no network)**: instantiated `Pi3X(use_multimodal=True)` and ran a real forward pass
+with `intrinsics` + `poses` priors (`with_prior=True, overall_prob=1.0, ray_dirs_prob=1.0,
+cam_prob=1.0`) on 4 synthetic 98×98 frames. Produced correctly-shaped, finite
+`points`/`camera_poses`/`conf`/`metric` outputs in ~5s on CPU. This confirms the
+prior-injection code path is structurally sound — only `Pi3X.from_pretrained(...)`'s
+actual HF download is still unverified (needs internet + a real Kaggle/GPU session).
+
+**Bonus finding**: `FlashAttentionRope` — the attention class Pi3X's decoder actually
+uses (`pi3x.py:125`, `attn_class=FlashAttentionRope`) — calls
+`torch.nn.functional.scaled_dot_product_attention` with `SDPBackend.FLASH_ATTENTION`
+only for bf16 inputs, else `[SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]`
+(`layers/attention.py:339-344`). On a T4 (fp16, no bf16) this takes the
+MATH/EFFICIENT_ATTENTION path automatically — **no xformers required for Pi3X's core
+decoder**. The other attention variants (`MemEffAttention` etc., used inside the DINOv2
+encoder) additionally have an explicit `if not XFORMERS_AVAILABLE: return
+super().forward(x)` fallback to plain softmax attention (`layers/attention.py:74-79`).
+**Net effect: Pi3X has no hard xformers dependency**, lowering install risk further
+than Phase 0 §4 assumed for the geoff3d package as a whole (that risk assessment still
+stands for anything that *does* import the full `geoff3d` package/SLRF — moot now that
+B doesn't).
+
+## 10. UAVFF3D fine-tuned checkpoints (github.com/yanxian-ll/UAVFF3D)
+
+Found and verified by cloning both `UAVFF3D` (dataset/benchmark description) and its
+companion `uavff3d_evaluate_forward_models` (the actual training/eval code, MapAnything-
+based training interface per its own README) repos.
+
+- **Checkpoints available**: Pi3, Pi3X, MapAnything, VGGT — fine-tuned on real+synthetic
+  UAV data, distributed via Baidu Netdisk (not Kaggle-native; user is uploading as a
+  Kaggle dataset separately).
+- **Prior settings match our design exactly**: their own eval protocol table (README.md)
+  defines **RGB** (images only) / **C** (+ intrinsics) / **P** (+ poses) / **CP** (+ both)
+  — the same four-way toggle already planned for `PriorMode` in `backbone.py`.
+- **Checkpoint format, confirmed from `scripts/convert_hf_to_benchmark_checkpoint.py`
+  (lines 93-114)**: `{"model": model.state_dict(), "hf_model_name": ..., "conversion_info": ...}`
+  — **plain, unprefixed keys**, matching the target model class's own `state_dict()`
+  directly (no `Pi3XWrapper`-style `model.*` prefix problem for checkpoints produced
+  this way). `benchmarking/dense_n_view/benchmark.py:1481-1483` confirms the loading
+  side: `ckpt = torch.load(...); model.load_state_dict(ckpt["model"], strict=False)` —
+  **the reference implementation itself silently ignores key mismatches** (only prints
+  the `_IncompatibleKeys` result). Our own `strict_load_checkpoint()` in `backbone.py`
+  deliberately does not do this: it requires an exact key match (or a single mechanical
+  `model.` prefix strip/add, the one variant actually observed in this codebase), and
+  raises `BackboneNotAvailableError` with the full missing/unexpected key lists otherwise.
+  **Verified locally** with three synthetic cases against a real `Pi3X` instance: exact
+  match, `model.`-prefixed match (recovered via stripping), and a genuinely corrupted
+  state dict (correctly raises instead of partially loading).
+- **Checkpoint auto-detection**: `io_detect.find_checkpoints()` scans `/kaggle/input` for
+  `.pth/.pt/.safetensors` files matching filename hints (`mapanything`/`mapa`, `pi3x`,
+  `pi3`, `vggt`), preferring a name containing "best". Wired into `DetectedInputs.checkpoints:
+  dict[backbone_key, Path]`, consumed by `backbone.select_backbone(..., use_finetuned=True)`.
+- **Still unverified (needs the actual Kaggle dataset once uploaded)**: whether the
+  real UAVFF3D-published checkpoint files use exactly this `{"model": ...}` format (the
+  convert script only proves the *authors'* own benchmark-conversion path does; the
+  fine-tuning training loop's own checkpoint-saving code was not located/read in this
+  pass — `mapanything/train/training.py` exists but its `torch.save` call site wasn't
+  traced). If the real files differ, `strict_load_checkpoint`'s loud failure is the
+  correct behavior (surface the exact key diff rather than silently running on
+  partially-random weights), not a bug to work around blindly.

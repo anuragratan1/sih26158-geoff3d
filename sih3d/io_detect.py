@@ -22,6 +22,17 @@ TELEMETRY_EXTS = {".srt", ".csv", ".gpx", ".kml", ".json", ".tlog", ".bin"}
 INTRINSICS_HINT_EXTS = {".json", ".yaml", ".yml"}
 INTRINSICS_KEYS = {"fx", "fy", "cx", "cy", "camera_matrix", "K", "intrinsics", "intrinsic_matrix"}
 CACHE_DIR_HINTS = {"cache", "checkpoints", "wheels", "sih3d_cache", "sih3d-cache"}
+CHECKPOINT_EXTS = {".pth", ".pt", ".safetensors"}
+# Name fragments identifying which backbone a fine-tuned checkpoint belongs to
+# (UAVFF3D-style filenames, e.g. "mapa_finetuning_.../checkpoint-best.pth",
+# "pi3x_finetuning_.../checkpoint-best.pth"). Order matters: more specific
+# fragments first so "pi3x" doesn't also match a stray "pi3" substring check.
+CHECKPOINT_NAME_HINTS: dict[str, list[str]] = {
+    "mapanything": ["mapanything", "map_anything", "map-anything", "mapa"],
+    "pi3x": ["pi3x"],
+    "pi3": ["pi3"],
+    "vggt": ["vggt"],
+}
 
 
 @dataclass
@@ -43,6 +54,7 @@ class DetectedInputs:
     intrinsics_path: Path | None = None
     intrinsics: dict | None = None
     cache_dir: Path | None = None
+    checkpoints: dict[str, Path] = field(default_factory=dict)  # backbone key -> checkpoint path
     warnings: list[str] = field(default_factory=list)
 
 
@@ -184,6 +196,34 @@ def find_cache_dir(input_root: Path) -> Path | None:
     return None
 
 
+def find_checkpoints(input_root: Path) -> dict[str, Path]:
+    """Find fine-tuned backbone checkpoints anywhere under /kaggle/input.
+
+    Matches by filename fragment against CHECKPOINT_NAME_HINTS (e.g. a
+    published UAVFF3D-checkpoints dataset containing
+    ".../mapa_finetuning_.../checkpoint-best.pth"). Does not open/validate
+    the file — that's backbone.py's job (strict key-checked load, fail
+    loudly on mismatch). If multiple candidates match the same backbone,
+    prefers a path containing "best", then the most recently modified.
+    """
+    found: dict[str, list[Path]] = {}
+    for p in _iter_files(input_root):
+        if p.suffix.lower() not in CHECKPOINT_EXTS:
+            continue
+        haystack = str(p).lower()
+        for backbone_key, hints in CHECKPOINT_NAME_HINTS.items():
+            if backbone_key in found:
+                continue  # already resolved this backbone key at a higher-priority hint
+            if any(hint in haystack for hint in hints):
+                found.setdefault(backbone_key, []).append(p)
+
+    resolved: dict[str, Path] = {}
+    for backbone_key, candidates in found.items():
+        candidates.sort(key=lambda c: (0 if "best" in c.name.lower() else 1, -c.stat().st_mtime))
+        resolved[backbone_key] = candidates[0]
+    return resolved
+
+
 def detect_all(input_root: Path = Path("/kaggle/input")) -> DetectedInputs:
     result = DetectedInputs()
 
@@ -211,5 +251,10 @@ def detect_all(input_root: Path = Path("/kaggle/input")) -> DetectedInputs:
         result.warnings.append("No intrinsics file found — will use metadata or model-estimated intrinsics")
 
     result.cache_dir = find_cache_dir(input_root)
+
+    result.checkpoints = find_checkpoints(input_root)
+    if result.checkpoints:
+        found_str = ", ".join(f"{k}={v.name}" for k, v in result.checkpoints.items())
+        result.warnings.append(f"Fine-tuned checkpoint(s) detected: {found_str}")
 
     return result
