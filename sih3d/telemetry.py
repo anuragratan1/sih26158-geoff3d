@@ -510,6 +510,44 @@ def ecef_to_enu(x, y, z, lat0_deg, lon0_deg, alt0_m) -> tuple[float, float, floa
     return e, n, u
 
 
+def enu_to_ecef(e: float, n: float, u: float, lat0_deg: float, lon0_deg: float, alt0_m: float) -> tuple[float, float, float]:
+    """Inverse of ecef_to_enu — used to convert an aligned world-frame
+    (post-align.py) point or camera track back to ECEF/geodetic for
+    trajectory.geojson/.kml export, which need lon/lat."""
+    lat0, lon0 = math.radians(lat0_deg), math.radians(lon0_deg)
+    sl, cl = math.sin(lat0), math.cos(lat0)
+    so, co = math.sin(lon0), math.cos(lon0)
+    # Transpose of the rotation used in ecef_to_enu (it's orthonormal).
+    dx = -so * e - sl * co * n + cl * co * u
+    dy = co * e - sl * so * n + cl * so * u
+    dz = cl * n + sl * u
+    x0, y0, z0 = geodetic_to_ecef(lat0_deg, lon0_deg, alt0_m)
+    return x0 + dx, y0 + dy, z0 + dz
+
+
+def ecef_to_geodetic(x: float, y: float, z: float, n_iters: int = 5) -> tuple[float, float, float]:
+    """Iterative ECEF -> geodetic (lat_deg, lon_deg, alt_m). A handful of
+    Newton iterations on the WGS84 ellipsoid converges to sub-millimeter
+    accuracy, which is more than enough given our GPS input is already
+    consumer-grade at best."""
+    lon = math.atan2(y, x)
+    e2 = WGS84_F * (2 - WGS84_F)
+    p = math.hypot(x, y)
+    lat = math.atan2(z, p * (1 - e2))
+    alt = 0.0
+    for _ in range(n_iters):
+        sin_lat = math.sin(lat)
+        n = WGS84_A / math.sqrt(1 - e2 * sin_lat ** 2)
+        alt = p / math.cos(lat) - n
+        lat = math.atan2(z, p * (1 - e2 * n / (n + alt)))
+    return math.degrees(lat), math.degrees(lon), alt
+
+
+def enu_to_geodetic(e: float, n: float, u: float, lat0_deg: float, lon0_deg: float, alt0_m: float) -> tuple[float, float, float]:
+    x, y, z = enu_to_ecef(e, n, u, lat0_deg, lon0_deg, alt0_m)
+    return ecef_to_geodetic(x, y, z)
+
+
 def track_to_enu(track: TelemetryTrack) -> tuple[list[tuple[float, float, float]], tuple[float, float, float], tuple[int, int]]:
     """Returns (enu_points, origin(lat,lon,alt), (utm_zone, epsg))."""
     if not track:
