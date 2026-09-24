@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Generates sih26158_geoff3d.ipynb from the sih3d/ source files.
+"""Generates sih26158_geoff3d.ipynb.
 
-Every %%writefile cell's content is read directly from the actual sih3d/
-files on disk at build time — the notebook and the source can never drift,
-because the notebook IS the source, packaged. Re-run this script any time
-sih3d/ changes and re-upload the regenerated notebook.
+The sih3d/ package is NOT embedded in the notebook — the Setup cell git
+clones/pulls it from https://github.com/anuragratan1/sih26158-geoff3d at
+run time, so a code fix is `git push` + re-running the Setup and Launch
+cells, never a full notebook re-upload. This script only assembles the
+driver cells (config/setup/launch/results); re-run it whenever those
+change, not for ordinary sih3d/ code changes (those just need a git push).
 
 Usage:
     python3 build_notebook.py
@@ -19,7 +21,6 @@ from pathlib import Path
 import nbformat as nbf
 
 ROOT = Path(__file__).parent
-SIH3D = ROOT / "sih3d"
 OUT_PATH = ROOT / "sih26158_geoff3d.ipynb"
 
 
@@ -29,24 +30,6 @@ def code(src: str):
 
 def md(src: str):
     return nbf.v4.new_markdown_cell(src.strip("\n") + "\n")
-
-
-def writefile_cell(path: Path) -> "nbf.NotebookNode":
-    """Builds the cell directly (bypassing code()'s strip/normalize, which
-    would silently mangle trailing whitespace on files not ending in a
-    newline) so the embedded content is byte-for-byte identical to the
-    source file — the entire point of generating cells from disk instead
-    of hand-copying them."""
-    rel = path.relative_to(ROOT).as_posix()
-    content = path.read_text()
-    if not content:
-        # IPython's %%writefile magic raises "UsageError: cell body is
-        # empty" for a truly empty cell body (confirmed via nbconvert
-        # --execute — sih3d/vendor/__init__.py and friends are legitimately
-        # empty files). A single newline round-trips to an empty-for-Python-
-        # purposes __init__.py while giving the magic a non-empty body.
-        content = "\n"
-    return nbf.v4.new_code_cell(f"%%writefile {rel}\n" + content)
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +93,14 @@ print(f"MODE={MODE}  BACKBONE={BACKBONE}  PRIOR_MODE={PRIOR_MODE}  USE_FINETUNED
 '''
 
 SETUP_CELL = '''
-# ============================== SETUP: env check, install, detect inputs ====
-# One cell, top to bottom: environment checks -> install only what's missing
-# -> detect the video/telemetry/checkpoints already attached under
-# /kaggle/input -> ready for the Launch cell below. Kaggle's image already
-# has torch preinstalled — nothing here reinstalls/pins it (GeoFF3D's own
-# pyproject pins torch==2.5.0, exactly the kind of forced-reinstall the task
-# spec says to avoid; see PHASE0_NOTES.md section 4).
+# ============================== SETUP: sync code, env check, install, detect inputs ====
+# One cell, top to bottom: pull the sih3d/ package from GitHub -> environment
+# checks -> install only what's missing -> detect the video/telemetry/
+# checkpoints already attached under /kaggle/input -> ready for the Launch
+# cell below. Kaggle's image already has torch preinstalled — nothing here
+# reinstalls/pins it (GeoFF3D's own pyproject pins torch==2.5.0, exactly the
+# kind of forced-reinstall the task spec says to avoid; see PHASE0_NOTES.md
+# section 4).
 import importlib
 import subprocess
 import sys
@@ -124,6 +108,28 @@ import time
 from pathlib import Path
 
 _t0 = time.time()
+
+# -- 0. sync code from GitHub -------------------------------------------
+# The sih3d/ package lives in git, not embedded in this notebook — a code
+# fix is a `git push` on the source side, then re-running just THIS cell
+# (which re-pulls) and the Launch cell below, never a full notebook
+# re-upload or a Setup/install rerun. `--ff-only` refuses to silently
+# overwrite local edits made directly in CODE_DIR (e.g. via a scratch
+# debugging cell) with a fast-forward that would discard them.
+REPO_URL = "https://github.com/anuragratan1/sih26158-geoff3d.git"
+CODE_DIR = Path("/kaggle/working/sih26158-geoff3d")
+if CODE_DIR.exists():
+    _sync = subprocess.run(["git", "-C", str(CODE_DIR), "pull", "--ff-only"], capture_output=True, text=True, timeout=60)
+    if _sync.returncode == 0:
+        print(f"Code: pulled latest into {CODE_DIR}\\n{_sync.stdout.strip()}")
+    else:
+        print(f"Code: pull failed, using existing checkout as-is ({_sync.stderr.strip()[-300:]})")
+else:
+    _sync = subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(CODE_DIR)], capture_output=True, text=True, timeout=180)
+    if _sync.returncode != 0:
+        raise RuntimeError(f"git clone of {REPO_URL} failed: {_sync.stderr.strip()[-500:]}")
+    print(f"Code: cloned into {CODE_DIR}")
+sys.path.insert(0, str(CODE_DIR))
 
 # -- 1. environment checks ---------------------------------------------------
 
@@ -160,8 +166,6 @@ if not _gpu_ok:
     print("WARNING: no GPU detected. The pipeline will still run on CPU as a "
           "last-resort fallback, but this will be VERY slow. Enable a GPU "
           "under Notebook Settings -> Accelerator.")
-
-sys.path.insert(0, str(Path.cwd()))
 
 # -- 2. install ---------------------------------------------------------------
 
@@ -329,17 +333,6 @@ if telemetry is None or len(telemetry) == 0:
 print(f"\\nSetup done in {time.time()-_t0:.1f}s total.")
 '''
 
-DIRS_CELL = '''
-# %%writefile (used by every cell below this one) does not create parent
-# directories on its own, so create every directory the module-source cells
-# write into, up front, before any of them run.
-from pathlib import Path
-
-for _d in __SIH3D_DIRS__:
-    Path(_d).mkdir(parents=True, exist_ok=True)
-print("sih3d/ package directories ready")
-'''
-
 CACHE_SAVE_NOTE_MD = """
 ### Publishing a cache dataset (speeds up future runs)
 
@@ -362,7 +355,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path.cwd()))
+sys.path.insert(0, str(CODE_DIR))  # CODE_DIR from the Setup cell above
 import sih3d.events as events_mod
 import sih3d.gpu_monitor as gpu_monitor_mod
 import sih3d.report as report_mod
@@ -447,7 +440,7 @@ import importlib
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path.cwd()))
+sys.path.insert(0, str(CODE_DIR))  # CODE_DIR from the Setup cell above
 import sih3d.stage_views as stage_views_mod
 importlib.reload(stage_views_mod)
 from sih3d.stage_views import (
@@ -494,38 +487,12 @@ for status in getattr(pipeline, "_export_statuses", []):
 '''
 
 
-def collect_dirs() -> list[str]:
-    dirs = set()
-    for f in sorted(SIH3D.rglob("*.py")):
-        if "__pycache__" in f.parts:
-            continue
-        rel_dir = f.parent.relative_to(ROOT).as_posix()
-        dirs.add(rel_dir)
-    return sorted(dirs)
-
-
 def build() -> None:
     nb = nbf.v4.new_notebook()
-    cells = [md(TITLE_MD), code(CONFIG_CELL)]
-
-    dirs = collect_dirs()
-    dirs_literal = "[\n    " + ",\n    ".join(f'"{d}"' for d in dirs) + ",\n]"
-    cells.append(code(DIRS_CELL.replace("__SIH3D_DIRS__", dirs_literal)))
-
-    cells.append(md("## Module source (`sih3d/`) — generated from the actual source files at build time; collapsed by default, click to expand if you need to inspect it"))
-    module_files = sorted(
-        (f for f in SIH3D.rglob("*.py") if "__pycache__" not in f.parts),
-        key=lambda p: p.relative_to(ROOT).as_posix(),
-    )
-    for f in module_files:
-        cell = writefile_cell(f)
-        cell["metadata"]["jupyter"] = {"source_hidden": True}
-        cells.append(cell)
-
-    cells.append(code(SETUP_CELL))
-    cells.append(md(CACHE_SAVE_NOTE_MD))
-    cells.append(code(LAUNCH_CELL))
-    cells.append(code(RESULTS_CELL))
+    cells = [
+        md(TITLE_MD), code(CONFIG_CELL), code(SETUP_CELL), md(CACHE_SAVE_NOTE_MD),
+        code(LAUNCH_CELL), code(RESULTS_CELL),
+    ]
 
     nb["cells"] = cells
     nb["metadata"] = {
@@ -535,8 +502,7 @@ def build() -> None:
 
     nbf.validate(nb)
     OUT_PATH.write_text(nbf.writes(nb))
-    driver_cells = len(cells) - len(module_files)
-    print(f"Wrote {OUT_PATH} ({len(cells)} cells total: {len(module_files)} module-source cells [collapsed] + {driver_cells} driver cells)")
+    print(f"Wrote {OUT_PATH} ({len(cells)} cells) — sih3d/ is pulled from GitHub by the Setup cell, no module-source cells embedded")
 
 
 if __name__ == "__main__":
