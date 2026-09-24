@@ -9,12 +9,24 @@ kernel (they just have no frontend to render to), so the state-accumulation
 logic here is unit-testable headlessly; the actual visual layout can only be
 verified in a real notebook.
 
+Deliberately no anywidget and no plotly FigureWidget anywhere in this file.
+A first real Kaggle run hit "No version of module anywidget is registered"
+— anywidget (like any custom ipywidgets extension, including plotly's
+FigureWidget) needs its JS registered with the front end at *kernel start*,
+before the notebook even begins executing cells; installing the Python
+package at pip-install time, mid-run, is too late; the front end already
+decided what it knows. Only ipywidgets' own built-in widgets (Output,
+Image, HTML, ...) and plain matplotlib PNGs piped through them are safe to
+rely on here — nothing that needs its own front-end extension. The Live 3D
+panel is therefore a plain matplotlib top-down + oblique scatter of the
+growing point cloud, redrawn on the same throttled cadence as every other
+panel (see render_if_due / _render_live3d_panel below), not a live 3D
+widget.
+
 The dashboard must render before installs/downloads start (per the task's
 "dashboard-first" requirement), so nothing in construction can depend on a
-package that isn't preinstalled on Kaggle. ipywidgets/matplotlib/PIL are
-safe; anywidget/plotly are NOT guaranteed present yet at construction time
-this early — the inline 3D viewer degrades to a lightweight fallback (see
-_build_live3d_panel) rather than importing anywidget eagerly and failing.
+package that isn't preinstalled on Kaggle — ipywidgets/matplotlib/PIL are
+safe.
 """
 
 from __future__ import annotations
@@ -273,43 +285,25 @@ class Dashboard:
         self.geometry_out = W.Output()
         self.geometry_box = W.VBox([W.HTML("<b>Geometry (latest chunk)</b>"), self.geometry_out], layout=W.Layout(border="1px solid #30363d", padding="6px", width="48%"))
 
+    # Cap how many points the Live 3D panel keeps in memory for redraws —
+    # unbounded growth over a long FULL-mode run would slow the matplotlib
+    # scatter down and bloat notebook memory for no visual benefit past a
+    # certain density; beyond the cap, new chunks replace a random sample
+    # of existing points so the displayed cloud still reflects the whole
+    # scanned area rather than only the most recent chunk.
+    _LIVE3D_MAX_POINTS = 200_000
+
     def _build_live3d_panel(self) -> None:
-        """Primary: the anywidget inline viewer (full-quality, binary-
-        streamed — see inline_viewer.py). Fallback (anywidget unavailable
-        or fails to import): a periodically-regenerated data-URL three.js
-        view reusing viewer.py's own HTML builder, with a downsampled
-        point cloud. Never imports anywidget/plotly at Dashboard
-        construction time in a way that could delay the dashboard-first
-        requirement — this try/except is the only place that happens, and
-        failure here just means "use the fallback", not "crash"."""
         W = self._W
-        self.inline_viewer = None
-        try:
-            from .inline_viewer import InlineViewer
-
-            if InlineViewer is not None:
-                self.inline_viewer = InlineViewer()
-        except Exception:
-            self.inline_viewer = None
-
-        self.mesh_mode = False
-        self._latest_mesh_payload = None
-
-        if self.inline_viewer is not None:
-            self.live3d_box = W.VBox(
-                [W.HTML("<b>Live 3D</b>"), self.inline_viewer],
-                layout=W.Layout(border="1px solid #30363d", padding="6px", margin="0 0 8px 0"),
-            )
-        else:
-            self._fallback_points_xyz = np.zeros((0, 3), dtype=np.float32)
-            self._fallback_points_color = np.zeros((0, 3), dtype=np.uint8)
-            self._fallback_points_conf = np.zeros((0,), dtype=np.float32)
-            self._last_fallback_render = 0.0
-            self.live3d_fallback_html = W.HTML("<i>3D preview will appear here once chunks are processed (fallback mode — anywidget unavailable, using a downsampled static viewer).</i>")
-            self.live3d_box = W.VBox(
-                [W.HTML("<b>Live 3D (fallback mode)</b>"), self.live3d_fallback_html],
-                layout=W.Layout(border="1px solid #30363d", padding="6px", margin="0 0 8px 0"),
-            )
+        self._live3d_xyz = np.zeros((0, 3), dtype=np.float32)
+        self._live3d_color = np.zeros((0, 3), dtype=np.uint8)
+        self._live3d_rng = np.random.default_rng(0)
+        self._last_live3d_render = 0.0
+        self.live3d_out = W.Output()
+        self.live3d_box = W.VBox(
+            [W.HTML("<b>Live 3D (point cloud, growing per chunk)</b>"), self.live3d_out],
+            layout=W.Layout(border="1px solid #30363d", padding="6px", margin="0 0 8px 0"),
+        )
 
     def _build_rasters_panel(self) -> None:
         W = self._W
@@ -451,18 +445,7 @@ class Dashboard:
         elif evt.type == EventType.POINTCLOUD_GROWTH:
             xyz = p.get("points")
             if xyz is not None and len(xyz) > 0:
-                if self.inline_viewer is not None:
-                    try:
-                        self.inline_viewer.push_points(xyz, p.get("colors"), p.get("confidence"))
-                    except Exception:
-                        pass
-                else:
-                    self._append_fallback_points(xyz, p.get("colors"), p.get("confidence"))
-
-        elif evt.type == EventType.MESH_PREVIEW:
-            self.mesh_mode = True
-            self._latest_mesh_payload = p
-            self._push_mesh_preview(p)
+                self._append_live3d_points(xyz, p.get("colors"))
 
         elif evt.type == EventType.RASTERS_READY:
             for name in ("dsm_path", "orthomosaic_path", "coverage_path"):
@@ -478,25 +461,6 @@ class Dashboard:
 
         elif evt.type == EventType.PIPELINE_DONE:
             self._render_results(p)
-
-    def _push_mesh_preview(self, payload: dict) -> None:
-        mesh_result = payload.get("mesh")
-        bake = payload.get("bake")
-        stage = payload.get("stage", "coarse")
-        if mesh_result is None or mesh_result.mesh is None or self.inline_viewer is None:
-            return
-        mesh = mesh_result.mesh
-        try:
-            vertices = np.asarray(mesh.vertices, dtype=np.float32)
-            indices = np.asarray(mesh.triangles, dtype=np.uint32).reshape(-1)
-            colors = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8) if mesh.has_vertex_colors() else None
-            uv = texture_png = None
-            if bake is not None and getattr(bake, "textured", False):
-                uv = bake.uv
-                texture_png = _encode_png(bake.texture_rgb)
-            self.inline_viewer.push_mesh(vertices, indices, colors=colors, uv=uv, texture_png=texture_png, stage=stage)
-        except Exception:
-            pass
 
     def _update_overall_progress(self) -> None:
         n = len(self.stage_cards)
@@ -515,20 +479,17 @@ class Dashboard:
             items.append(img)
         self.filmstrip.children = items
 
-    def _append_fallback_points(self, xyz: np.ndarray, colors: np.ndarray | None, confidence: np.ndarray | None, cap: int = 150_000) -> None:
-        self._fallback_points_xyz = np.concatenate([self._fallback_points_xyz, xyz.astype(np.float32)], axis=0)
-        if colors is not None:
-            self._fallback_points_color = np.concatenate([self._fallback_points_color, colors.astype(np.uint8)], axis=0)
-        if confidence is not None:
-            self._fallback_points_conf = np.concatenate([self._fallback_points_conf, confidence.astype(np.float32)], axis=0)
+    def _append_live3d_points(self, xyz: np.ndarray, colors: np.ndarray | None) -> None:
+        n = len(xyz)
+        cols = colors.astype(np.uint8) if colors is not None and len(colors) == n else np.full((n, 3), 160, dtype=np.uint8)
+        self._live3d_xyz = np.concatenate([self._live3d_xyz, xyz.astype(np.float32)], axis=0)
+        self._live3d_color = np.concatenate([self._live3d_color, cols], axis=0)
 
-        if len(self._fallback_points_xyz) > cap:
-            idx = np.random.default_rng(0).choice(len(self._fallback_points_xyz), size=cap, replace=False)
-            self._fallback_points_xyz = self._fallback_points_xyz[idx]
-            if len(self._fallback_points_color):
-                self._fallback_points_color = self._fallback_points_color[idx]
-            if len(self._fallback_points_conf):
-                self._fallback_points_conf = self._fallback_points_conf[idx]
+        total = len(self._live3d_xyz)
+        if total > self._LIVE3D_MAX_POINTS:
+            idx = self._live3d_rng.choice(total, size=self._LIVE3D_MAX_POINTS, replace=False)
+            self._live3d_xyz = self._live3d_xyz[idx]
+            self._live3d_color = self._live3d_color[idx]
 
     def _rebuild_rasters_tab(self) -> None:
         W = self._W
@@ -570,7 +531,7 @@ class Dashboard:
         self._render_gpu_panel()
         self._render_trajectory_panel()
         self._render_geometry_panel()
-        self._render_fallback_live3d_panel(now, force)
+        self._render_live3d_panel(now, force)
         self._render_log_panel()
 
     def _render_gpu_panel(self) -> None:
@@ -638,49 +599,42 @@ class Dashboard:
             plt.show()
             plt.close(fig)
 
-    def _render_fallback_live3d_panel(self, now: float, force: bool) -> None:
-        """Only used when anywidget/InlineViewer is unavailable. Much
-        coarser cadence than the main 2Hz throttle (rebuilding a three.js
-        HTML blob and re-embedding it as an iframe is comparatively heavy)
-        — every 5s, or on force (e.g. the final render)."""
-        if self.inline_viewer is not None:
+    def _render_live3d_panel(self, now: float, force: bool) -> None:
+        """A plain matplotlib top-down + oblique scatter of the point
+        cloud accumulated so far — see the module docstring for why this
+        is static-per-redraw rather than a live 3D widget. Redrawn on a
+        coarser cadence than the main throttle (rebuilding a 3D scatter is
+        comparatively heavy) — every 3s, or on force (e.g. the final
+        render)."""
+        if not force and now - self._last_live3d_render < 3.0:
             return
-        if not force and now - self._last_fallback_render < 5.0:
+        if len(self._live3d_xyz) == 0:
             return
-        if len(self._fallback_points_xyz) == 0:
-            return
-        self._last_fallback_render = now
+        self._last_live3d_render = now
         try:
-            from .fusion import FusedPointCloud
-            from .viewer import write_viewer_html
-
-            n = len(self._fallback_points_xyz)
-            cloud = FusedPointCloud(
-                points=self._fallback_points_xyz,
-                colors=self._fallback_points_color if len(self._fallback_points_color) == n else np.full((n, 3), 128, dtype=np.uint8),
-                view_count=np.ones(n, dtype=np.int32),
-                confidence=self._fallback_points_conf if len(self._fallback_points_conf) == n else np.ones(n, dtype=np.float32),
-            )
-            mesh_glb_path = None
-            if self._latest_mesh_payload is not None:
-                candidate = self.output_dir / "mesh.glb" if self.output_dir else None
-                if candidate is not None and candidate.exists():
-                    mesh_glb_path = candidate
-
-            from .events import EventBus
-
-            tmp_path = Path("/tmp/sih3d_fallback_viewer.html")
-            status = write_viewer_html(
-                tmp_path, EventBus(), cloud=cloud, mesh_glb_path=mesh_glb_path,
-                gps_track_enu=self.gps_track, camera_track_enu=self.camera_track,
-                georeferenced=bool(self._header_info.get("georeferenced", False)),
-                max_points=50_000,
-            )
-            if status.ok:
-                html = tmp_path.read_text(encoding="utf-8").replace('"', "&quot;")
-                self.live3d_fallback_html.value = f"<iframe srcdoc=\"{html}\" style='width:100%;height:500px;border:none;'></iframe>"
+            import matplotlib.pyplot as plt
         except Exception:
-            pass
+            return
+        pts = self._live3d_xyz
+        colors01 = np.clip(self._live3d_color, 0, 255) / 255.0
+        with self.live3d_out:
+            self.live3d_out.clear_output(wait=True)
+            fig = plt.figure(figsize=(9, 3.6))
+            ax_top = fig.add_subplot(121, projection="3d")
+            ax_top.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=colors01, s=0.3)
+            ax_top.view_init(elev=89, azim=-90)
+            ax_top.set_title(f"Top-down ({len(pts):,} pts)", fontsize=8)
+            ax_top.set_axis_off()
+
+            ax_obl = fig.add_subplot(122, projection="3d")
+            ax_obl.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=colors01, s=0.3)
+            ax_obl.view_init(elev=25, azim=-60)
+            ax_obl.set_title("Oblique", fontsize=8)
+            ax_obl.set_axis_off()
+
+            plt.tight_layout()
+            plt.show()
+            plt.close(fig)
 
     def _render_log_panel(self) -> None:
         self.log_html.value = "<pre style='font-size:11px;margin:0;'>" + "\n".join(self.log_lines) + "</pre>"

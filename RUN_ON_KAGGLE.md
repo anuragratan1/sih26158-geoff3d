@@ -102,9 +102,14 @@ dashboard in the main thread as it goes:
 - **Trajectory panel**: GPS track vs. the estimated camera trajectory, once
   alignment has run.
 - **Geometry panel**: depth + confidence maps of the latest processed chunk.
-- **Live 3D panel**: the point cloud growing chunk by chunk (downsampled to
-  150k points for the live preview — the actual output files aren't
-  downsampled), with an RGB/height/confidence color toggle.
+- **Live 3D panel**: a static matplotlib top-down + oblique scatter of the
+  point cloud accumulated so far, redrawn every ~3s as chunks finish
+  (capped at 200k displayed points — the actual output files aren't
+  downsampled). Deliberately plain ipywidgets/matplotlib, not a live 3D
+  widget — a custom widget extension like anywidget needs its JS
+  registered with the front end at kernel start, which pip-installing it
+  mid-run can't do (this is what "No version of module anywidget is
+  registered" on a first real run meant).
 - **Log panel**: the last ~30 log lines.
 - **Results card**: a table of every output file with size/status, and the
   embedded `viewer.html` once the mesh stage finishes.

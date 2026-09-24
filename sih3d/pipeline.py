@@ -99,6 +99,9 @@ class PipelineConfig:
     keyframe_min_gps_spacing_m: float = 2.0
     keyframe_max_no_gps_stride: int = 5
     keyframe_sharpness_percentile_floor: float = 15.0
+    keyframe_sample_fps: float = 4.0
+    decode_working_width: int = 1920
+    watchdog_stall_s: float = 60.0
 
 
 @dataclass
@@ -207,6 +210,17 @@ class Pipeline:
         self._chunk_queue: "queue.Queue" = queue.Queue(maxsize=3)
         self._SENTINEL = object()
 
+        # Watchdog: touched by every _emit()/_log() call, polled by a
+        # background thread — if a stage sits without producing a single
+        # event for watchdog_stall_s, that's exactly the kind of silent
+        # stall a first real Kaggle run hit (20+ min stuck in frame
+        # extraction with no indication anything was wrong).
+        self._last_progress_ts = time.time()
+        self._current_stage: str | None = None
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_last_warn_ts: float = 0.0
+
         self.two_gpu = gpu_monitor.device_count >= 2
         self.fusion_acc = VoxelPointFusion(config.voxel_size_m, device=config.device0)
         self.masker: masks.DynamicObjectMasker | None = None
@@ -250,6 +264,7 @@ class Pipeline:
             self.result = PipelineResult(success=False, error=str(e), traceback=tb, outputs=self._export_statuses)
         finally:
             self.stop_event.set()
+            self._watchdog_stop.set()
             try:
                 self.gpu_monitor.stop()
             except Exception:
@@ -271,12 +286,42 @@ class Pipeline:
         run: report.json showed every stage as "pending" because nothing
         was draining the bus into `report` at all yet)."""
         ts = time.time()
+        self._last_progress_ts = ts
+        if event_type == EventType.STAGE_START:
+            self._current_stage = payload.get("stage")
+        elif event_type in (EventType.STAGE_DONE, EventType.STAGE_ERROR):
+            self._current_stage = None
         self.bus.publish(event_type, **payload)
         self.report.on_event(Event(type=event_type, payload=payload, ts=ts))
 
     def _log(self, message: str, level: str = "info") -> None:
+        self._last_progress_ts = time.time()
         self.bus.log(message, level=level)
         self.report.on_event(Event(type=EventType.LOG, payload={"message": message, "level": level}, ts=time.time()))
+
+    def _watchdog_loop(self) -> None:
+        """Polls for silent stalls (see class docstring / decode.py's own
+        docstring for the real Kaggle run this is a response to). Only
+        warns while a stage is actually in progress (STAGE_START seen,
+        STAGE_DONE/ERROR not yet) — a long gap between stages (e.g.
+        waiting on a subprocess mesh export) isn't a stall by itself as
+        long as SOME stage is marked active; every meaningful unit of work
+        inside a stage goes through _emit()/_log(), which is what resets
+        the clock this checks."""
+        while not self._watchdog_stop.wait(10.0):
+            if self._current_stage is None:
+                continue
+            now = time.time()
+            stalled_s = now - self._last_progress_ts
+            if stalled_s < self.config.watchdog_stall_s:
+                continue
+            if now - self._watchdog_last_warn_ts < 30.0:
+                continue  # already warned recently about this same stall
+            self._watchdog_last_warn_ts = now
+            self.bus.log(
+                f"WATCHDOG: no progress for {stalled_s:.0f}s in stage '{self._current_stage}' — "
+                f"this may be a stall, not necessarily an error", level="warn",
+            )
 
     def _fallback(self, stage: str, exc: Exception) -> None:
         note = f"{type(exc).__name__}: {exc}"
@@ -302,6 +347,9 @@ class Pipeline:
         cfg = self.config
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
         self.gpu_monitor.start()
+        self._last_progress_ts = time.time()
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True, name="sih3d-watchdog")
+        self._watchdog_thread.start()
 
         video = self.detected.video
         if video is None:
@@ -469,7 +517,10 @@ class Pipeline:
 
         end_s = cfg.quick_seconds if cfg.mode == "QUICK" else None
         raw_indices, raw_ts, raw_frames = [], [], []
-        for idx, t, frame in decoder.iter_frames(start_s=0.0, end_s=end_s):
+        for idx, t, frame in decoder.iter_frames(
+            start_s=0.0, end_s=end_s,
+            target_fps=cfg.keyframe_sample_fps, scale_width=cfg.decode_working_width,
+        ):
             if self.stop_event.is_set():
                 break
             raw_indices.append(idx)
@@ -773,7 +824,7 @@ class Pipeline:
             min_confidence=self.config.min_confidence,
         )
         # Full-resolution chunk, not downsampled — the inline viewer (see
-        # dashboard.py/inline_viewer.py) needs real data to stream, and it
+        # dashboard.py's Live 3D panel) needs real data to stream, and it
         # does its own LOD above 2M accumulated points. A too-small preview
         # here would defeat the point of a "full-quality" live view.
         flat_pts = points_world.reshape(-1, 3)

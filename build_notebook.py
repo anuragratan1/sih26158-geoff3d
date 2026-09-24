@@ -186,11 +186,16 @@ def _pip_install(spec: str, extra_args: list[str] | None = None, label: str | No
 print("\\nChecking/installing dependencies (only what's missing)...")
 
 # Core numeric/vision/geo stack (no torch dependency in any of these).
+# Deliberately no anywidget/plotly here — see dashboard.py's module
+# docstring: a first real Kaggle run hit "No version of module anywidget
+# is registered" because any custom ipywidgets extension needs its JS
+# registered with the front end at kernel start, not installable mid-run;
+# the dashboard only uses ipywidgets' own built-in widgets now.
 _simple_deps = [
     ("scipy", "scipy"), ("xatlas", "xatlas"), ("PIL", "pillow"),
     ("laspy", "laspy"), ("rasterio", "rasterio"), ("pyproj", "pyproj"),
     ("trimesh", "trimesh"), ("open3d", "open3d"), ("pymavlink", "pymavlink"),
-    ("ipywidgets", "ipywidgets"), ("plotly", "plotly"),
+    ("ipywidgets", "ipywidgets"),
     ("huggingface_hub", "huggingface_hub"), ("safetensors", "safetensors"),
 ]
 for _mod, _pkg in _simple_deps:
@@ -199,10 +204,21 @@ for _mod, _pkg in _simple_deps:
     else:
         print(f"  [already present] {_pkg}")
 
-# GPU-accelerated video decode (best-effort; decode.py falls back to ffmpeg
-# CUDA, then plain CPU decode if this isn't installable).
-if not _try_import("torchcodec"):
-    _pip_install("torchcodec", label="torchcodec (optional GPU decode)")
+# GPU video decode: deliberately NOT pip-installing torchcodec. A first
+# real Kaggle run stalled 20+ minutes in frame extraction (CPU 100%, GPU
+# idle) because the generic PyPI torchcodec wheel silently decoded on CPU
+# despite claiming a CUDA device — it imports fine either way, so pip
+# installing "some torchcodec build" isn't actually useful without also
+# pinning an exact CUDA-matching wheel from the PyTorch index, which is
+# fragile across Kaggle image updates. decode.py now verifies real GPU
+# throughput before trusting torchcodec (using it only if it's already
+# importable AND passes that check) and otherwise uses ffmpeg -hwaccel
+# cuda directly — no extra install needed, and it's what's actually
+# driving GPU decode on this run either way.
+if _try_import("torchcodec"):
+    print("  [already present] torchcodec (will only be trusted if decode.py's real GPU-throughput check passes)")
+else:
+    print("  [skipped] torchcodec (relying on ffmpeg -hwaccel cuda instead — see decode.py)")
 
 # Dynamic-object masking (best-effort; masks.py degrades to all-static).
 if not _try_import("ultralytics"):
