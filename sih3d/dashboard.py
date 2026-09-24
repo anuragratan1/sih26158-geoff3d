@@ -571,7 +571,8 @@ class Dashboard:
                 xs, ys = zip(*self.camera_track)
                 ax.plot(xs, ys, "-", color="#238636", label="estimated camera", linewidth=1)
             ax.set_aspect("equal")
-            ax.legend(fontsize=6)
+            if self.gps_track or self.processed_track or self.camera_track:
+                ax.legend(fontsize=6)
             plt.tight_layout()
             plt.show()
             plt.close(fig)
