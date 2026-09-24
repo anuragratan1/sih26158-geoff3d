@@ -74,26 +74,26 @@ def build_vertex_colored_mesh(
     # orient_normals_consistent_tangent_plane is a minimum-spanning-tree
     # propagation over the point cloud's KNN graph — real-world observed
     # cost on a several-hundred-thousand-point cloud: minutes, with zero
-    # progress reporting since it's one opaque native call. That's exactly
-    # the silent multi-minute mesh_textured_model stall seen in practice
-    # (watchdog firing repeatedly with nothing to show), distinct from and
-    # in addition to Poisson/xatlas's own already-bounded steps. Isolated +
-    # timed out the same way as those; on timeout, falls back to plain
-    # per-point estimate_normals with NO consistent orientation — faster
-    # (no MST) and Poisson tolerates locally-inconsistent normals reasonably
-    # well, so meshing still proceeds rather than stalling the whole stage.
-    normals_out = _run_isolated_meshing(
+    # progress reporting since it's one opaque native call. Isolated + timed
+    # out like every other step here; on timeout, falls back to plain
+    # per-point estimate_normals with NO consistent orientation (faster, no
+    # MST) — which is ALSO isolated+timed-out, not called inline: a real run
+    # showed the naive fallback itself stall the exact same way (large
+    # clouds make even plain KDTree normal estimation slow enough to trip
+    # the watchdog). If both attempts fail, normals stays None and meshing
+    # skips straight to the no-normals-needed Delaunay fallback below rather
+    # than feeding Poisson/ball-pivoting normals that were never computed.
+    stage = "mesh_textured_model"
+    normals = _run_isolated_meshing(
         _normals_worker, (cloud.points, colors01), bus, "normal estimation",
-        timeout_s=60.0, stage="mesh_textured_model", progress_range=(0.0, 0.15),
+        timeout_s=60.0, stage=stage, progress_range=(0.0, 0.15),
     )
-    if normals_out is not None:
-        normals = normals_out
-    else:
+    if normals is None:
         bus.log("Falling back to fast normal estimation without consistent orientation", level="warn")
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(cloud.points)
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
-        normals = np.asarray(pcd.normals)
+        normals = _run_isolated_meshing(
+            _normals_fast_worker, (cloud.points, colors01), bus, "normal estimation (fast)",
+            timeout_s=30.0, stage=stage, progress_range=(0.15, 0.25),
+        )
 
     # Open3D's native Poisson/ball-pivoting solvers can hard-abort the whole
     # process on degenerate/pathological point distributions (observed
@@ -103,39 +103,45 @@ def build_vertex_colored_mesh(
     # isolated subprocess so a crash there kills only that subprocess; the
     # pipeline sees it as an ordinary failure and falls back normally.
     method = "poisson"
-    poisson_out = _run_isolated_meshing(
-        _poisson_worker, (cloud.points, colors01, normals, poisson_depth), bus, "Poisson",
-        stage="mesh_textured_model", progress_range=(0.0, 0.2),
-    )
-    if poisson_out is not None:
-        vertices, triangles, vcolors = poisson_out
-    else:
-        bus.log("Poisson reconstruction failed/crashed; trying ball-pivoting as a second fallback", level="warn")
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(cloud.points)
-        distances = pcd.compute_nearest_neighbor_distance()
-        avg_dist = float(np.mean(distances)) if len(distances) else 0.05
-        radii = [avg_dist * r for r in (1.5, 2.0, 3.0)]
-        bp_out = _run_isolated_meshing(
-            _ball_pivot_worker, (cloud.points, colors01, normals, radii), bus, "ball-pivoting",
-            stage="mesh_textured_model", progress_range=(0.0, 0.2),
+    vertices = triangles = vcolors = None
+    if normals is not None:
+        poisson_out = _run_isolated_meshing(
+            _poisson_worker, (cloud.points, colors01, normals, poisson_depth), bus, "Poisson",
+            stage=stage, progress_range=(0.25, 0.5),
         )
-        if bp_out is not None:
-            vertices, triangles, vcolors = bp_out
-            method = "ball_pivoting"
+        if poisson_out is not None:
+            vertices, triangles, vcolors = poisson_out
         else:
-            bus.log(
-                "Ball-pivoting also failed/crashed; trying 2.5D Delaunay triangulation as a third fallback "
-                "(a ground-projected heightfield mesh — often the more robust choice for open, nadir-view "
-                "aerial point clouds anyway, since Poisson/ball-pivoting assume more closed/volumetric input)",
-                level="warn",
+            bus.log("Poisson reconstruction failed/crashed; trying ball-pivoting as a second fallback", level="warn")
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(cloud.points)
+            distances = pcd.compute_nearest_neighbor_distance()
+            avg_dist = float(np.mean(distances)) if len(distances) else 0.05
+            radii = [avg_dist * r for r in (1.5, 2.0, 3.0)]
+            bp_out = _run_isolated_meshing(
+                _ball_pivot_worker, (cloud.points, colors01, normals, radii), bus, "ball-pivoting",
+                stage=stage, progress_range=(0.25, 0.5),
             )
-            dt_out = _run_isolated_meshing(_delaunay_2p5d_worker, (cloud.points, colors01), bus, "Delaunay 2.5D", timeout_s=30.0)
-            if dt_out is None:
-                bus.log("2.5D Delaunay also failed — mesh generation skipped", level="warn")
-                return MeshResult(mesh=None, method="none")
-            vertices, triangles, vcolors = dt_out
-            method = "delaunay_2p5d"
+            if bp_out is not None:
+                vertices, triangles, vcolors = bp_out
+                method = "ball_pivoting"
+
+    if vertices is None:
+        bus.log(
+            "Trying 2.5D Delaunay triangulation (a ground-projected heightfield mesh, needs no normals — "
+            "often the more robust choice for open, nadir-view aerial point clouds anyway, since Poisson/"
+            "ball-pivoting assume more closed/volumetric input)",
+            level="warn",
+        )
+        dt_out = _run_isolated_meshing(
+            _delaunay_2p5d_worker, (cloud.points, colors01), bus, "Delaunay 2.5D",
+            timeout_s=30.0, stage=stage, progress_range=(0.5, 0.65),
+        )
+        if dt_out is None:
+            bus.log("2.5D Delaunay also failed — mesh generation skipped", level="warn")
+            return MeshResult(mesh=None, method="none")
+        vertices, triangles, vcolors = dt_out
+        method = "delaunay_2p5d"
 
     if len(vertices) == 0:
         bus.log("Meshing produced zero vertices — mesh generation skipped", level="warn")
@@ -160,6 +166,25 @@ def _normals_worker(points, colors01, result_queue) -> None:
         pcd.colors = _o3d.utility.Vector3dVector(colors01)
         pcd.estimate_normals(search_param=_o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
         pcd.orient_normals_consistent_tangent_plane(30)
+        result_queue.put(np.asarray(pcd.normals))
+    except Exception as e:
+        result_queue.put(e)
+
+
+def _normals_fast_worker(points, colors01, result_queue) -> None:
+    """No orient_normals_consistent_tangent_plane (the slow MST step) —
+    just per-point PCA normals. Still isolated+timed-out like every other
+    step here: on a large enough cloud even plain estimate_normals' KDTree
+    build/query can run long enough to trip the watchdog, and this was
+    previously called inline with zero timeout at all — the exact bug
+    being fixed (a real run showed a second "normal estimation timed out
+    after 60s" from this fallback itself)."""
+    try:
+        import open3d as _o3d
+
+        pcd = _o3d.geometry.PointCloud()
+        pcd.points = _o3d.utility.Vector3dVector(points)
+        pcd.estimate_normals(search_param=_o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
         result_queue.put(np.asarray(pcd.normals))
     except Exception as e:
         result_queue.put(e)
@@ -409,7 +434,7 @@ def bake_texture(
     bus.log(f"Texture baking: UV-unwrapping {len(faces)} faces via xatlas (bounded to 45s)...")
     unwrap = _run_isolated_xatlas(
         vertices, faces, bus, timeout_s=45.0,
-        stage="mesh_textured_model", progress_range=(0.4, 0.7),
+        stage="mesh_textured_model", progress_range=(0.65, 0.85),
     )
     if unwrap is None:
         return TextureBakeResult(textured=False, skipped_reason="xatlas UV-unwrap failed or timed out")
@@ -426,11 +451,20 @@ def bake_texture(
     n_faces = len(indices)
     baked = 0
     skipped_time_budget = False
+    _last_progress_emit = 0.0
 
     for fi in range(n_faces):
-        if time.time() - t0 > time_budget_s:
+        elapsed = time.time() - t0
+        if elapsed > time_budget_s:
             skipped_time_budget = True
             break
+        if elapsed - _last_progress_emit >= 0.5:
+            bus.publish(
+                EventType.STAGE_PROGRESS, stage="mesh_textured_model",
+                frac=0.85 + 0.15 * min(1.0, fi / max(n_faces, 1)),
+                rate_label=f"texture baking: {fi}/{n_faces} faces, {elapsed:.0f}s/{time_budget_s:.0f}s budget",
+            )
+            _last_progress_emit = elapsed
 
         centroid = face_centroids_world[fi]
         normal = face_normals[fi] if fi < len(face_normals) else np.array([0.0, 0.0, 1.0])

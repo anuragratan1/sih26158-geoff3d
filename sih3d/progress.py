@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 
 from .events import Event, EventType
 
@@ -15,66 +14,114 @@ from .events import Event, EventType
 # ever shows something an actual person asked for.
 _BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar}| {elapsed}<{remaining}{postfix}"
 
+# One dynamic bar spans the WHOLE run instead of one bar per pipeline stage
+# stacking up in the output. The six underlying stage names pipeline.py
+# emits are collapsed into four human-meaningful phases (geometric_
+# reconstruction/large_scale_alignment/dense_point_cloud all START and
+# FINISH together for a single QUICK-mode chunk, so showing them as three
+# separate simultaneous bars was pure clutter, not three separate things
+# actually happening in sequence). Weights are a rough split of typical
+# wall time, not a promise — they only affect how far the single bar moves
+# per phase, never whether a phase is "done" (that's driven by real
+# STAGE_DONE events, same as before).
+_PHASES = [
+    ("frame_extraction", "Decoding video", ("frame_extraction",), 15),
+    ("camera_trajectory", "Estimating camera poses", ("camera_trajectory",), 5),
+    ("reconstruction", "3D reconstruction", ("geometric_reconstruction", "large_scale_alignment", "dense_point_cloud"), 40),
+    ("mesh_textured_model", "Building mesh + texture", ("mesh_textured_model",), 40),
+]
 
-@dataclass
-class _StageBar:
-    bar: object
-    progress: int = 0
-    t0: float = 0.0
+_STAGE_TO_PHASE: dict[str, str] = {}
+_PHASE_RANGE: dict[str, tuple[float, float]] = {}
+_PHASE_LABEL: dict[str, str] = {}
+_PHASE_MEMBERS: dict[str, tuple[str, ...]] = {}
+_cursor = 0.0
+for _key, _label, _members, _weight in _PHASES:
+    _PHASE_RANGE[_key] = (_cursor, _cursor + _weight)
+    _PHASE_LABEL[_key] = _label
+    _PHASE_MEMBERS[_key] = _members
+    for _m in _members:
+        _STAGE_TO_PHASE[_m] = _key
+    _cursor += _weight
 
 
 class ConsoleProgress:
-    """Consumes events with plain tqdm bars and terse, useful log lines.
+    """Consumes events with ONE plain tqdm bar spanning the whole run, plus
+    terse, useful log lines.
 
-    It deliberately never serializes images, plots GPU graphs, or creates
-    ipywidgets.  This keeps the notebook's main thread out of the frame
-    extraction hot path while retaining stage, FPS, ETA, and warning output.
-    Every stage prints one plain-English "done in Xs" line on completion —
-    the bar itself disappears once a stage finishes (tqdm's `leave=False`),
-    so the scrollback reads as a clean list of finished steps with times,
-    not a wall of stale 100% bars.
+    Deliberately never serializes images, plots GPU graphs, or creates
+    ipywidgets — keeps the notebook's main thread out of the frame
+    extraction hot path while retaining stage, FPS, ETA, and warning
+    output. Prints one plain-English "done in Xs" line per phase on
+    completion; the bar itself never multiplies — there is exactly one,
+    always visible, moving left to right across the whole run.
     """
 
     def __init__(self) -> None:
         from tqdm import tqdm
 
         self._tqdm = tqdm
-        self._bars: dict[str, _StageBar] = {}
+        self._bar = None
+        self._progress = 0.0  # 0-100, monotonic
+        self._current_phase: str | None = None
+        self._phase_t0: dict[str, float] = {}
+        self._done_stages: set[str] = set()
+        self._reported_phase_done: set[str] = set()
         self._last_log: str | None = None
         self._run_t0 = time.time()
 
-    def _get_or_make_bar(self, stage: str) -> _StageBar:
-        state = self._bars.get(stage)
-        if state is None:
-            bar = self._tqdm(total=100, desc=stage.replace("_", " "), bar_format=_BAR_FORMAT, leave=False)
-            state = _StageBar(bar=bar, t0=time.time())
-            self._bars[stage] = state
-        return state
+    def _ensure_bar(self) -> None:
+        if self._bar is None:
+            self._bar = self._tqdm(total=100, desc="Starting", bar_format=_BAR_FORMAT, leave=True)
+
+    def _set_progress(self, target: float) -> None:
+        self._ensure_bar()
+        target = min(100.0, max(self._progress, target))
+        self._bar.update(target - self._progress)
+        self._progress = target
+
+    def _enter_phase(self, phase: str) -> None:
+        self._ensure_bar()
+        if phase not in self._phase_t0:
+            self._phase_t0[phase] = time.time()
+        if self._current_phase != phase:
+            self._current_phase = phase
+            self._bar.set_description(_PHASE_LABEL.get(phase, phase.replace("_", " ")), refresh=False)
+            lo, _ = _PHASE_RANGE.get(phase, (self._progress, 100.0))
+            self._set_progress(max(self._progress, lo))
+
+    def _maybe_report_phase_done(self, phase: str) -> None:
+        members = _PHASE_MEMBERS.get(phase, (phase,))
+        if phase in self._reported_phase_done or not all(m in self._done_stages for m in members):
+            return
+        self._reported_phase_done.add(phase)
+        _, hi = _PHASE_RANGE.get(phase, (self._progress, self._progress))
+        self._set_progress(hi)
+        elapsed = time.time() - self._phase_t0.get(phase, time.time())
+        total = time.time() - self._run_t0
+        self._tqdm.write(f"[done] {_PHASE_LABEL.get(phase, phase)} — {elapsed:.0f}s (total elapsed {total:.0f}s)")
 
     def on_event(self, evt: Event) -> None:
         payload = evt.payload
-        if evt.type in (EventType.STAGE_START, EventType.SETUP_STAGE_START):
-            self._get_or_make_bar(payload.get("stage", "working"))
+        if evt.type == EventType.STAGE_START:
+            stage = payload.get("stage", "working")
+            self._enter_phase(_STAGE_TO_PHASE.get(stage, stage))
         elif evt.type == EventType.STAGE_PROGRESS:
-            state = self._get_or_make_bar(payload.get("stage", "working"))
+            stage = payload.get("stage", "working")
+            phase = _STAGE_TO_PHASE.get(stage, stage)
+            self._enter_phase(phase)
             frac = payload.get("frac")
             if frac is not None:
-                target = min(100, max(state.progress, round(float(frac) * 100)))
-                state.bar.update(target - state.progress)
-                state.progress = target
+                lo, hi = _PHASE_RANGE.get(phase, (self._progress, 100.0))
+                self._set_progress(lo + (hi - lo) * min(1.0, max(0.0, float(frac))))
             rate = payload.get("rate_label")
             if rate:
-                state.bar.set_postfix_str(rate, refresh=False)
-        elif evt.type in (EventType.STAGE_DONE, EventType.SETUP_STAGE_DONE):
+                self._ensure_bar()
+                self._bar.set_postfix_str(rate, refresh=False)
+        elif evt.type == EventType.STAGE_DONE:
             stage = payload.get("stage", "working")
-            state = self._bars.get(stage)
-            if state is not None:
-                state.bar.update(100 - state.progress)
-                state.progress = 100
-                state.bar.close()
-                elapsed = time.time() - state.t0
-                total = time.time() - self._run_t0
-                self._tqdm.write(f"[done] {stage.replace('_', ' ')} — {elapsed:.0f}s (total elapsed {total:.0f}s)")
+            self._done_stages.add(stage)
+            self._maybe_report_phase_done(_STAGE_TO_PHASE.get(stage, stage))
         elif evt.type == EventType.LOG:
             message = str(payload.get("message", ""))
             # Progress logs already carry rate/ETA through the bar; preserve
@@ -85,7 +132,7 @@ class ConsoleProgress:
                     self._last_log = message
 
     def close(self) -> None:
-        for state in self._bars.values():
-            if state.progress < 100:
-                state.bar.close()
+        if self._bar is not None:
+            self._set_progress(100.0)
+            self._bar.close()
         self._tqdm.write(f"[done] total elapsed {time.time() - self._run_t0:.0f}s")
