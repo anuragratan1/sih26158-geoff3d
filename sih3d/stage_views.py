@@ -468,9 +468,21 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
 
     try:
         all_pts = verts if verts is not None else points
-        bounds = list(zip((all_pts[:, i].min() for i in range(3)), (all_pts[:, i].max() for i in range(3))))
+        # 1st-99th percentile, not raw min/max: a handful of outlier points
+        # (fusion isn't perfect even after remove_statistical_outliers) can
+        # blow the bounding box out to many times the actual structure's
+        # size, which is exactly what made the real orbit video show the
+        # object as a tiny dim speck in a mostly-empty frame — the axis
+        # limits were sized to fit outliers nobody wanted to see, not the
+        # object. A little padding (8%) keeps it from looking cropped.
+        lo = np.percentile(all_pts, 1, axis=0)
+        hi = np.percentile(all_pts, 99, axis=0)
+        pad = (hi - lo) * 0.08
+        lo, hi = lo - pad, hi + pad
+        bounds = list(zip(lo, hi))
 
         fig = plt.figure(figsize=(6.4, 4.8), dpi=100)
+        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)  # no border padding around the 3D axes
         ax = fig.add_subplot(111, projection="3d")
         ax.set_facecolor((0.05, 0.06, 0.08))
         fig.patch.set_facecolor((0.05, 0.06, 0.08))
@@ -479,7 +491,12 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
                 verts[faces], facecolor=colors if colors is not None else "#888888", linewidths=0,
             ))
         else:
-            ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=point_colors, s=0.5, marker=".")
+            # No stored color -> color by height (z) instead of matplotlib's
+            # single flat default color, which at a small marker size on a
+            # near-black background was nearly invisible.
+            point_c = point_colors if point_colors is not None else points[:, 2]
+            point_cmap = None if point_colors is not None else "viridis"
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=point_c, cmap=point_cmap, s=2.5, marker=".", depthshade=False)
         ax.set_xlim(*bounds[0]); ax.set_ylim(*bounds[1]); ax.set_zlim(*bounds[2])
         ax.set_box_aspect((bounds[0][1] - bounds[0][0], bounds[1][1] - bounds[1][0], bounds[2][1] - bounds[2][0]))
         ax.axis("off")

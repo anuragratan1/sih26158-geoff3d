@@ -69,7 +69,22 @@ def build_vertex_colored_mesh(
         bus.log("Too few fused points for meshing — mesh generation skipped", level="warn")
         return MeshResult(mesh=None, method="none")
 
+    points = cloud.points
     colors01 = np.clip(cloud.colors, 0, 255) / 255.0
+
+    # Cap the point count BEFORE normal estimation instead of just giving
+    # the MST orientation step more time: its cost scales with point count,
+    # so a bigger timeout on a bigger cloud just means a longer guaranteed
+    # wait, not a more reliable one. 200k points is comfortably enough
+    # density for a QUICK-mode mesh preview and keeps normal estimation +
+    # Poisson (which also benefits from fewer points) reliably inside their
+    # existing timeouts instead of needing them raised indefinitely as
+    # point count grows.
+    _MESH_POINT_CAP = 200_000
+    if len(points) > _MESH_POINT_CAP:
+        idx = np.random.default_rng(0).choice(len(points), size=_MESH_POINT_CAP, replace=False)
+        points, colors01 = points[idx], colors01[idx]
+        bus.log(f"Meshing: downsampled {len(cloud.points):,} -> {_MESH_POINT_CAP:,} points for normal estimation/reconstruction speed")
 
     # orient_normals_consistent_tangent_plane is a minimum-spanning-tree
     # propagation over the point cloud's KNN graph — real-world observed
@@ -85,13 +100,13 @@ def build_vertex_colored_mesh(
     # than feeding Poisson/ball-pivoting normals that were never computed.
     stage = "mesh_textured_model"
     normals = _run_isolated_meshing(
-        _normals_worker, (cloud.points, colors01), bus, "normal estimation",
+        _normals_worker, (points, colors01), bus, "normal estimation",
         timeout_s=60.0, stage=stage, progress_range=(0.0, 0.15),
     )
     if normals is None:
         bus.log("Falling back to fast normal estimation without consistent orientation", level="warn")
         normals = _run_isolated_meshing(
-            _normals_fast_worker, (cloud.points, colors01), bus, "normal estimation (fast)",
+            _normals_fast_worker, (points, colors01), bus, "normal estimation (fast)",
             timeout_s=30.0, stage=stage, progress_range=(0.15, 0.25),
         )
 
@@ -106,7 +121,7 @@ def build_vertex_colored_mesh(
     vertices = triangles = vcolors = None
     if normals is not None:
         poisson_out = _run_isolated_meshing(
-            _poisson_worker, (cloud.points, colors01, normals, poisson_depth), bus, "Poisson",
+            _poisson_worker, (points, colors01, normals, poisson_depth), bus, "Poisson",
             stage=stage, progress_range=(0.25, 0.5),
         )
         if poisson_out is not None:
@@ -114,12 +129,12 @@ def build_vertex_colored_mesh(
         else:
             bus.log("Poisson reconstruction failed/crashed; trying ball-pivoting as a second fallback", level="warn")
             pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(cloud.points)
+            pcd.points = o3d.utility.Vector3dVector(points)
             distances = pcd.compute_nearest_neighbor_distance()
             avg_dist = float(np.mean(distances)) if len(distances) else 0.05
             radii = [avg_dist * r for r in (1.5, 2.0, 3.0)]
             bp_out = _run_isolated_meshing(
-                _ball_pivot_worker, (cloud.points, colors01, normals, radii), bus, "ball-pivoting",
+                _ball_pivot_worker, (points, colors01, normals, radii), bus, "ball-pivoting",
                 stage=stage, progress_range=(0.25, 0.5),
             )
             if bp_out is not None:
@@ -134,7 +149,7 @@ def build_vertex_colored_mesh(
             level="warn",
         )
         dt_out = _run_isolated_meshing(
-            _delaunay_2p5d_worker, (cloud.points, colors01), bus, "Delaunay 2.5D",
+            _delaunay_2p5d_worker, (points, colors01), bus, "Delaunay 2.5D",
             timeout_s=30.0, stage=stage, progress_range=(0.5, 0.65),
         )
         if dt_out is None:
@@ -423,6 +438,21 @@ def bake_texture(
         from PIL import Image, ImageDraw
     except Exception as e:
         return TextureBakeResult(textured=False, skipped_reason=f"PIL not available ({e})")
+
+    # xatlas's UV-unwrap cost scales with face count, so — same principle
+    # as the point-count cap before normal estimation above — decimate
+    # first instead of just giving it more time on a bigger mesh. Quadric
+    # edge-collapse is a fast, well-behaved Open3D op (not run in isolation
+    # like the meshing steps: it doesn't share their crash/hang history)
+    # and a 30k-face cap is plenty for a QUICK-mode textured preview.
+    _BAKE_FACE_CAP = 30_000
+    if len(mesh.triangles) > _BAKE_FACE_CAP:
+        n_before = len(mesh.triangles)
+        try:
+            mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=_BAKE_FACE_CAP)
+            bus.log(f"Texture baking: decimated mesh {n_before:,} -> {len(mesh.triangles):,} faces for UV-unwrap speed")
+        except Exception as e:
+            bus.log(f"Mesh decimation before texture baking failed ({e}); baking the full-resolution mesh instead", level="warn")
 
     vertices = np.asarray(mesh.vertices)
     faces = np.asarray(mesh.triangles)
