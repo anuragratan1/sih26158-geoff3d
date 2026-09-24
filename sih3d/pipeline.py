@@ -176,7 +176,7 @@ class Pipeline:
     def __init__(
         self, config: PipelineConfig, detected: DetectedInputs, telemetry: TelemetryTrack | None,
         bus: EventBus, gpu_monitor: GpuMonitor, report: ReportBuilder,
-        backbone_override: tuple | None = None,
+        backbone_override: tuple | None = None, live_page=None,
     ):
         """`backbone_override`: (GeometryBackbone, PriorMode), pre-built and
         already loaded. Testing/dependency-injection hook only — the real
@@ -184,7 +184,14 @@ class Pipeline:
         chosen via backbone.select_backbone from BACKBONE/PRIOR_MODE config)
         is unaffected. Used by the local dry-run harness to exercise the
         entire orchestration loop on CPU with a synthetic backbone, without
-        downloading real multi-GB models."""
+        downloading real multi-GB models.
+
+        `live_page`: an already-started live_page.LivePageServer, or None if
+        the tunnel/server failed to come up (bootstrap.py logs that and the
+        pipeline just runs without pushing to it — the dashboard's inline 3D
+        tab remains the fallback view). Kept as a plain optional handle
+        rather than a required dependency so the local dry-run harness and
+        any future non-notebook caller don't need to stand up a real server."""
         self.config = config
         self.detected = detected
         self.telemetry = telemetry
@@ -192,6 +199,7 @@ class Pipeline:
         self.gpu_monitor = gpu_monitor
         self.report = report
         self._backbone_override = backbone_override
+        self.live_page = live_page
 
         self.stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -274,6 +282,19 @@ class Pipeline:
         note = f"{type(exc).__name__}: {exc}"
         self._log(f"Stage '{stage}': {note} — continuing with degraded output", level="warn")
         self._emit(EventType.STAGE_FALLBACK, stage=stage, note=note)
+
+    def _push_live(self, fn, *args, **kwargs) -> None:
+        """Best-effort call into self.live_page. Disables further pushes
+        (rather than logging per-keyframe) on the first failure — a broken
+        live-page connection would otherwise spam one STAGE_FALLBACK per
+        frame; the dashboard's inline 3D tab keeps working regardless."""
+        if self.live_page is None:
+            return
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:
+            self._log(f"Live reconstruction page push failed ({type(e).__name__}: {e}) — disabling further pushes; inline 3D tab still works", level="warn")
+            self.live_page = None
 
     # -- main run ---------------------------------------------------------
 
@@ -682,12 +703,25 @@ class Pipeline:
         self.artifacts.chunk_alignments.append(record)
 
         world_cam = alignment.apply(cam_local)
-        for kf, wc in zip(chunk_kfs, world_cam):
+        for i, (kf, wc) in enumerate(zip(chunk_kfs, world_cam)):
             kf._resolved_world_pose = wc  # noqa: SLF001 — internal bookkeeping between pipeline stages
             self._emit(EventType.TRAJECTORY_POINT, kind="camera", x=wc[0], y=wc[1])
             self.artifacts.camera_track_enu.append(tuple(wc))
             if self.georeferenced and kf.gps_enu is not None:
                 self.gps_factors.append(align.GpsFactor(chunk=chunk_idx, cam_center_local=cam_local[len(self.gps_factors) % len(cam_local)], gps_enu=np.array(kf.gps_enu)))
+            if self.live_page is not None:
+                # Forward/up are only used by the client to orient the
+                # camera-frustum helper, not for any geometry math here — a
+                # coarse estimate (next waypoint direction, world +Z up) is
+                # enough for that purpose.
+                forward = world_cam[i + 1] - wc if i + 1 < len(world_cam) else (wc - world_cam[i - 1] if i > 0 else np.array([1.0, 0.0, 0.0]))
+                norm = np.linalg.norm(forward)
+                forward = forward / norm if norm > 1e-9 else np.array([1.0, 0.0, 0.0])
+                self._push_live(
+                    self.live_page.push_camera_pose,
+                    frame_index=kf.frame_index, timestamp_s=kf.timestamp_s,
+                    position=wc, forward=forward, up=np.array([0.0, 0.0, 1.0]),
+                )
 
         overlap_keys = [kf.frame_index for kf in chunk_kfs if kf.frame_index in self._prev_chunk_cam_local]
         if overlap_keys:
@@ -751,6 +785,29 @@ class Pipeline:
         self._emit(EventType.POINTCLOUD_GROWTH, points=flat_pts[keep], colors=flat_cols[keep], confidence=flat_conf[keep])
         self.artifacts.point_count = len(self.fusion_acc)
         _ = n_new
+
+        # Live reconstruction page: pushed PER FRAME (not the whole chunk in
+        # one message) so the client can reveal points frame by frame in
+        # sync with the left-hand video instead of a single chunk-sized pop.
+        # `masked` marks points the dynamic-object masker dropped from the
+        # fused cloud above — the client shows those in red when its
+        # "show masked-out objects" toggle is on rather than hiding them,
+        # so still emit them here (only NaNs are actually dropped).
+        if self.live_page is not None:
+            for i, kf in enumerate(chunk_kfs):
+                pts_i = points_world[i].reshape(-1, 3)
+                keep_i = np.isfinite(pts_i).all(axis=1)
+                masked_i = (
+                    dynamic_mask[i].reshape(-1)[keep_i].astype(np.uint8)
+                    if dynamic_mask is not None
+                    else np.zeros(int(keep_i.sum()), dtype=np.uint8)
+                )
+                self._push_live(
+                    self.live_page.push_points,
+                    pts_i[keep_i], colors[i].reshape(-1, 3)[keep_i],
+                    result.confidence[i].reshape(-1)[keep_i], masked_i,
+                    frame_index=kf.frame_index, timestamp_s=kf.timestamp_s,
+                )
 
     def _gpu1_worker(self) -> None:
         while True:

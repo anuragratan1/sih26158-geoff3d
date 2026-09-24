@@ -225,6 +225,17 @@ def run(
         bus.log(f"Full-screen viewer server unavailable ({e}); inline viewer still works", level="warn")
         bus.publish(EventType.TUNNEL_READY, url=None)
 
+    # -- live reconstruction page (best-effort, never blocks the pipeline) -
+    live_page_server = None
+    try:
+        from .live_page import start_live_page
+
+        live_page_server, live_url = start_live_page(detected.video.path, bus)
+        bus.publish(EventType.LIVE_PAGE_READY, url=live_url)
+    except Exception as e:
+        bus.log(f"Live reconstruction page unavailable ({e}); the dashboard's inline 3D tab is the fallback", level="warn")
+        bus.publish(EventType.LIVE_PAGE_READY, url=None)
+
     # -- pipeline ------------------------------------------------------------
     cfg = PipelineConfig(
         mode=mode, backbone_choice=backbone_choice, prior_mode=prior_mode, use_finetuned=use_finetuned,
@@ -232,7 +243,7 @@ def run(
         device0="cuda:0" if gpu_monitor.device_count >= 1 else "cpu",
         device1="cuda:1" if gpu_monitor.device_count >= 2 else ("cuda:0" if gpu_monitor.device_count >= 1 else "cpu"),
     )
-    pipeline = Pipeline(cfg, detected, telemetry, bus, gpu_monitor, report)
+    pipeline = Pipeline(cfg, detected, telemetry, bus, gpu_monitor, report, live_page=live_page_server)
     result.pipeline = pipeline
     pipeline._run_guarded()  # synchronous — bootstrap.run() already runs off the main thread
     result.ok = bool(pipeline.result and pipeline.result.success)
