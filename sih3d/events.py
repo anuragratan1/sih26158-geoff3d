@@ -34,6 +34,14 @@ class EventType(str, Enum):
     LOG = "log"
     PIPELINE_DONE = "pipeline_done"
     PIPELINE_ERROR = "pipeline_error"
+    HEADER_UPDATE = "header_update"       # bootstrap.py: video/telemetry/GPU info becomes known after detection
+    SETUP_STAGE_START = "setup_stage_start"    # bootstrap phases: env_check, install, detect_inputs
+    SETUP_STAGE_DONE = "setup_stage_done"
+    SETUP_STAGE_FALLBACK = "setup_stage_fallback"
+    SETUP_STAGE_ERROR = "setup_stage_error"
+    INSTALL_PROGRESS = "install_progress"  # one per package: pending/installing/ok/failed + timing
+    TUNNEL_READY = "tunnel_ready"           # fullscreen_server.py: cloudflared URL (or failure) known
+    RASTERS_READY = "rasters_ready"         # export.py's DSM/orthomosaic/coverage paths, for the Rasters tab
 
 
 @dataclass
