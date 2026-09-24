@@ -232,6 +232,7 @@ def _step_simple_deps() -> None:
         ("laspy", "laspy"), ("rasterio", "rasterio"), ("pyproj", "pyproj"),
         ("trimesh", "trimesh"), ("open3d", "open3d"), ("pymavlink", "pymavlink"),
         ("huggingface_hub", "huggingface_hub"), ("safetensors", "safetensors"),
+        ("psutil", "psutil"),  # CPU utilization tracking, alongside gpu_monitor's GPU tracking
     ]:
         if not _try_import(_mod):
             _pip_install(_pkg)

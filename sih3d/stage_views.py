@@ -366,12 +366,13 @@ def render_final_summary(report: ReportBuilder) -> None:
     def _row(s: dict) -> str:
         elapsed = f"{s['elapsed_s']:.1f}s" if s["elapsed_s"] is not None else "-"
         gpu = ", ".join(f"GPU{k}: {v:.0f}%" for k, v in s["avg_gpu_util_pct"].items()) or "-"
-        return f"<tr><td>{s['name']}</td><td>{s['status']}</td><td>{elapsed}</td><td>{gpu}</td></tr>"
+        cpu = f"{s['avg_cpu_util_pct']:.0f}%" if s.get("avg_cpu_util_pct") is not None else "-"
+        return f"<tr><td>{s['name']}</td><td>{s['status']}</td><td>{elapsed}</td><td>{gpu}</td><td>{cpu}</td></tr>"
 
     rows = "".join(_row(s) for s in d["stages"])
     from IPython.display import HTML, display
 
-    display(HTML(f"<table><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Avg GPU Util</th></tr>{rows}</table>"))
+    display(HTML(f"<table><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Avg GPU Util</th><th>Avg CPU Util</th></tr>{rows}</table>"))
     print(f"\nTotal elapsed: {d['total_elapsed_s']:.1f}s" if d["total_elapsed_s"] else "")
     print(f"Georeferenced: {d['georeferenced']}")
     print(f"Alignment RMSE vs GPS: {d['alignment_rmse_m']} m")

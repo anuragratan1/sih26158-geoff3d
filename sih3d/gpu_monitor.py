@@ -1,9 +1,13 @@
-"""Background GPU utilization/memory sampler (pynvml), 0.5s cadence.
+"""Background GPU + CPU utilization/memory sampler (pynvml + psutil), 0.5s
+cadence.
 
 Publishes GPU_SAMPLE events to the shared bus and keeps an in-memory
-per-GPU history so report.py can compute per-stage average utilization
-(stage boundaries are correlated by timestamp against STAGE_START/DONE
-events already on the bus's log, tracked separately in report.py).
+per-GPU (and overall-CPU) history so report.py can compute per-stage
+average utilization (stage boundaries are correlated by timestamp against
+STAGE_START/DONE events already on the bus's log, tracked separately in
+report.py) and pipeline.py can report full-run idle time — the actual
+"how much of the run did each GPU/the CPU sit idle" answer, not just an
+eyeballed screenshot of a resource widget.
 """
 
 from __future__ import annotations
@@ -21,6 +25,34 @@ try:
 except Exception:
     pynvml = None
     _NVML_OK = False
+
+try:
+    import psutil
+
+    _PSUTIL_OK = True
+except Exception:
+    psutil = None
+    _PSUTIL_OK = False
+
+
+@dataclass
+class CpuSample:
+    ts: float
+    percent: float  # 0-100, averaged across all cores (100 = every core fully busy)
+
+
+@dataclass
+class CpuHistory:
+    samples: list[CpuSample] = field(default_factory=list)
+
+    def append(self, s: CpuSample, cap: int = 20000) -> None:
+        self.samples.append(s)
+        if len(self.samples) > cap:
+            del self.samples[: len(self.samples) - cap]
+
+    def average(self, t0: float, t1: float) -> float | None:
+        vals = [s.percent for s in self.samples if t0 <= s.ts <= t1]
+        return sum(vals) / len(vals) if vals else None
 
 
 @dataclass
@@ -67,12 +99,17 @@ class GpuMonitor:
         self.bus = bus
         self.interval_s = interval_s
         self.history = GpuHistory()
+        self.cpu_history = CpuHistory()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._device_count = 0
         self._handles: list = []
         self._names: list[str] = []
         self._init_nvml()
+        if _PSUTIL_OK:
+            psutil.cpu_percent(interval=None)  # first call always returns 0.0/garbage; primes the internal baseline
+        else:
+            self.bus.log("psutil not available — CPU utilization tracking will show no data", level="warn")
 
     def _init_nvml(self) -> None:
         if not _NVML_OK:
@@ -101,7 +138,12 @@ class GpuMonitor:
         return list(self._names)
 
     def start(self) -> None:
-        if self._device_count == 0:
+        # Always starts, even with zero GPUs: CPU sampling (psutil) is
+        # independent of GPU presence, and a CPU-only fallback run
+        # shouldn't lose CPU utilization tracking just because there's no
+        # GPU to also watch. The per-GPU loop below is simply a no-op when
+        # self._handles is empty.
+        if self._device_count == 0 and not _PSUTIL_OK:
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="gpu-monitor", daemon=True)
@@ -154,5 +196,16 @@ class GpuMonitor:
                     decoder_util_pct=sample.decoder_util_pct,
                     ts=sample.ts,
                 )
+            if _PSUTIL_OK:
+                try:
+                    # interval=None: non-blocking, returns the average over
+                    # the time since the last call (primed once in
+                    # __init__) — NOT a blocking 1s measurement, which
+                    # would double this thread's own sampling interval.
+                    cpu_pct = float(psutil.cpu_percent(interval=None))
+                except Exception:
+                    cpu_pct = 0.0
+                self.cpu_history.append(CpuSample(ts=t0, percent=cpu_pct))
+                self.bus.publish(EventType.CPU_SAMPLE, ts=t0, percent=cpu_pct)
             elapsed = time.time() - t0
             self._stop.wait(max(0.0, self.interval_s - elapsed))

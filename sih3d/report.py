@@ -59,6 +59,7 @@ class ReportBuilder:
         self.started_at = time.time()
         self.finished_at: float | None = None
         self._gpu_samples: list[tuple[float, int, float]] = []
+        self._cpu_samples: list[tuple[float, float]] = []
 
     # -- event-driven updates -------------------------------------------------
 
@@ -85,6 +86,8 @@ class ReportBuilder:
                 st.status, st.end_ts = "error", evt.ts
         elif evt.type == EventType.GPU_SAMPLE:
             self._gpu_samples.append((p["ts"], p["index"], p["util_pct"]))
+        elif evt.type == EventType.CPU_SAMPLE:
+            self._cpu_samples.append((p["ts"], p["percent"]))
         elif evt.type == EventType.KEYFRAME_ACCEPTED:
             self.keyframe_count += 1
         elif evt.type == EventType.KEYFRAME_REJECTED:
@@ -136,6 +139,14 @@ class ReportBuilder:
                 by_gpu.setdefault(idx, []).append(util)
         return {idx: sum(v) / len(v) for idx, v in by_gpu.items()}
 
+    def stage_avg_cpu_util(self, name: str) -> float | None:
+        st = self.stages.get(name)
+        if st is None or st.start_ts is None:
+            return None
+        end = st.end_ts or time.time()
+        vals = [pct for ts, pct in self._cpu_samples if st.start_ts <= ts <= end]
+        return sum(vals) / len(vals) if vals else None
+
     def to_dict(self) -> dict:
         stages_out = []
         for name, st in self.stages.items():
@@ -143,6 +154,7 @@ class ReportBuilder:
             stages_out.append({
                 "name": name, "status": st.status, "elapsed_s": elapsed,
                 "avg_gpu_util_pct": self.stage_avg_gpu_util(name),
+                "avg_cpu_util_pct": self.stage_avg_cpu_util(name),
                 "fallback_notes": st.fallback_notes,
             })
         total_elapsed = (self.finished_at - self.started_at) if self.finished_at else None
@@ -179,9 +191,13 @@ class ReportBuilder:
         def fmt_s(v):
             return f"{v:.1f}s" if v is not None else "-"
 
+        def fmt_cpu(v):
+            return f"{v:.0f}%" if v is not None else "-"
+
         rows = "".join(
             f"<tr><td>{s['name']}</td><td>{s['status']}</td><td>{fmt_s(s['elapsed_s'])}</td>"
             f"<td>{', '.join(f'GPU{k}: {v:.0f}%' for k, v in s['avg_gpu_util_pct'].items()) or '-'}</td>"
+            f"<td>{fmt_cpu(s['avg_cpu_util_pct'])}</td>"
             f"<td>{'; '.join(s['fallback_notes']) or '-'}</td></tr>"
             for s in d["stages"]
         )
@@ -215,7 +231,7 @@ h1, h2 {{ font-weight: 600; }}
 <span class="badge">Total time: {fmt_s(d['total_elapsed_s'])}</span>
 </p>
 <h2>Stages</h2>
-<table><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Avg GPU Util</th><th>Fallback</th></tr>{rows}</table>
+<table><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Avg GPU Util</th><th>Avg CPU Util</th><th>Fallback</th></tr>{rows}</table>
 <h2>Geometry</h2>
 <ul>
 <li>Keyframes: {d['keyframe_count']} accepted, {d['rejected_keyframe_count']} rejected</li>

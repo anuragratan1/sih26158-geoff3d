@@ -27,6 +27,7 @@ class EventType(str, Enum):
     KEYFRAME_ACCEPTED = "keyframe_accepted"
     KEYFRAME_REJECTED = "keyframe_rejected"
     GPU_SAMPLE = "gpu_sample"
+    CPU_SAMPLE = "cpu_sample"
     TRAJECTORY_POINT = "trajectory_point"
     GEOMETRY_CHUNK = "geometry_chunk"
     POINTCLOUD_GROWTH = "pointcloud_growth"

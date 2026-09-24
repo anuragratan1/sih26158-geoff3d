@@ -231,6 +231,7 @@ class Pipeline:
         # stall a first real Kaggle run hit (20+ min stuck in frame
         # extraction with no indication anything was wrong).
         self._last_progress_ts = time.time()
+        self._run_t0: float = time.time()
         self._current_stage: str | None = None
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
@@ -286,6 +287,10 @@ class Pipeline:
         finally:
             self.stop_event.set()
             self._watchdog_stop.set()
+            try:
+                self._report_full_run_utilization()
+            except Exception:
+                pass
             try:
                 self.gpu_monitor.stop()
             except Exception:
@@ -373,6 +378,7 @@ class Pipeline:
     def _run(self) -> None:
         cfg = self.config
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        self._run_t0 = time.time()
         self.gpu_monitor.start()
         self._last_progress_ts = time.time()
         self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True, name="sih3d-watchdog")
@@ -1161,6 +1167,52 @@ class Pipeline:
                 note += f" ({idle_frac * 100:.0f}% of samples near-idle)"
             flagged = avg < 70.0 or (idle_frac or 0.0) > 0.20
             self._log(note, level="warn" if flagged else "info")
+
+    def _report_full_run_utilization(self, idle_below_pct: float = 5.0) -> None:
+        """Unconditional (unlike _report_dual_gpu_utilization, which only
+        ever ran under DUAL_GPU and only for the geometry-processing
+        window) — the actual "how much of the whole run did each GPU/the
+        CPU sit idle" answer, for every run regardless of mode, so
+        optimizing wall time has real numbers to aim at instead of
+        eyeballing a screenshot of a resource widget mid-run. Always runs,
+        even on a failed/partial pipeline (called from _run_guarded's
+        finally), since a stall's utilization signature is itself useful
+        diagnostic information."""
+        t0, t1 = self._run_t0, time.time()
+        total_s = t1 - t0
+        if total_s <= 0:
+            return
+
+        lines = [f"===== Resource utilization over the full run ({total_s:.0f}s) ====="]
+        for idx in range(self.gpu_monitor.device_count):
+            avg = self.gpu_monitor.history.average_util(idx, t0, t1)
+            dec_avg = self.gpu_monitor.history.average_util(idx, t0, t1, metric="decoder_util_pct")
+            idle_frac = self.gpu_monitor.history.idle_fraction(idx, t0, t1, idle_below_pct=idle_below_pct)
+            if avg is None:
+                lines.append(f"GPU{idx}: no samples collected")
+                continue
+            idle_s = (idle_frac or 0.0) * total_s
+            lines.append(
+                f"GPU{idx}: {avg:.0f}% avg SM util, {dec_avg or 0.0:.0f}% avg NVDEC util — "
+                f"idle (<{idle_below_pct:.0f}% SM) for {idle_s:.0f}s ({(idle_frac or 0.0) * 100:.0f}% of the run)"
+            )
+        cpu_avg = self.gpu_monitor.cpu_history.average(t0, t1)
+        if cpu_avg is not None:
+            cpu_vals = [s.percent for s in self.gpu_monitor.cpu_history.samples if t0 <= s.ts <= t1]
+            cpu_idle_frac = (sum(1 for v in cpu_vals if v < 15.0) / len(cpu_vals)) if cpu_vals else 0.0
+            lines.append(f"CPU: {cpu_avg:.0f}% avg (all cores) — idle (<15%) for {cpu_idle_frac * total_s:.0f}s ({cpu_idle_frac * 100:.0f}% of the run)")
+        else:
+            lines.append("CPU: no samples collected (psutil unavailable)")
+
+        # The single most actionable signal for "which resource is the
+        # bottleneck right now": every GPU idle at the same time CPU is
+        # busy means the current stage is CPU-bound (meshing/xatlas-style
+        # work), not something more GPU compute would speed up — the
+        # opposite (GPUs busy, CPU idle) means backbone/decode work, where
+        # DUAL_GPU or decode tuning are the actual levers.
+        lines.append("(low GPU% + high CPU% together = a CPU-bound stage, e.g. meshing — more/faster GPUs won't help there;")
+        lines.append(" high GPU% + low CPU% = a GPU-bound stage, e.g. backbone inference/decode — DUAL_GPU or decode tuning help there.)")
+        self._log("\n".join(lines))
         for device_label, idle_s in self._gpu_idle_s.items():
             if idle_s > 1.0:
                 self._log(f"DUAL_GPU: {device_label} spent {idle_s:.1f}s total waiting for its input queue", level="warn" if idle_s > 10 else "info")
