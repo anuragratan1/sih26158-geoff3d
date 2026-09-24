@@ -382,28 +382,36 @@ def render_final_summary(report: ReportBuilder) -> None:
             print(" -", f)
 
 
-def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: int = 48, video_fps: int = 24) -> None:
+def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: int = 36, video_fps: int = 12) -> None:
     """Best-effort: a few stills + a short orbit video rendered straight
     from the reconstructed mesh (falls back to the point cloud if no mesh
     was produced), displayed inline so there's something to actually look
-    at without leaving the notebook or downloading anything. Needs a
-    working headless GL context (EGL/OSMesa) for Open3D's offscreen
-    renderer and ffmpeg on PATH for the video — both best-effort, this
-    never raises past this function, it just says what's missing.
+    at without leaving the notebook or downloading anything.
 
-    Camera up-vector is explicitly [0, 0, 1]: every point/camera-track
-    coordinate in this pipeline is local-ENU (East-North-Up, Z is up — see
-    viewer.py/telemetry.py), not the [0, 1, 0] "Y-up" a lot of 3D tooling
-    defaults to. Getting that wrong is the single most common cause of a
-    render coming out sideways or upside-down.
+    Uses matplotlib, not Open3D's offscreen renderer — Open3D's high-level
+    `rendering.OffscreenRenderer` needs a working Vulkan loader (Filament),
+    which a real Kaggle GPU session does not have installed by default
+    ("Failed to load vulkan library!"), and installing system Vulkan
+    packages isn't something to gamble a notebook run on. matplotlib is
+    already a hard dependency of this file and needs no GPU rendering
+    backend at all — the tradeoff is a flat-shaded look, not a lit/
+    textured one, but it reliably renders on any box.
+
+    No separate "camera up" vector to get wrong here either: mplot3d's
+    `view_init(elev, azim)` is inherently relative to Z being vertical,
+    which already matches this pipeline's local-ENU (Z-up) point
+    convention (see viewer.py/telemetry.py) — the geometry is plotted
+    as-is, in its own (x, y, z) axes, with no separate up-vector to
+    misconfigure the way a real camera-based renderer has.
     """
-    import io
     import subprocess
     import tempfile
     from pathlib import Path
 
-    from IPython.display import Image as IPyImage, Video, display
-    from PIL import Image as PILImage
+    from IPython.display import Video, display
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    plt = _require_matplotlib()
 
     mesh_path = artifacts.output_paths.get("mesh.glb") or artifacts.output_paths.get("mesh.obj")
     cloud_path = artifacts.output_paths.get("pointcloud.ply")
@@ -411,69 +419,78 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
         print("Nothing to render yet: no mesh or point cloud output found.")
         return
 
-    try:
-        import open3d as o3d
-        import open3d.visualization.rendering as rendering
-    except Exception as e:
-        print(f"Showcase render unavailable: Open3D not usable ({e}).")
-        return
-
-    up = [0.0, 0.0, 1.0]  # ENU: Z is up
-
-    geometry, is_mesh = None, False
+    verts = faces = colors = points = point_colors = None
     if mesh_path:
         try:
-            m = o3d.io.read_triangle_mesh(mesh_path, enable_post_processing=True)
-            if len(m.vertices) > 0:
-                m.compute_vertex_normals()
-                geometry, is_mesh = m, True
+            import trimesh
+
+            m = trimesh.load(mesh_path, process=False)
+            if hasattr(m, "geometry"):  # a Scene (e.g. GLB) — take the first mesh
+                m = next(iter(m.geometry.values()))
+            verts, faces = np.asarray(m.vertices), np.asarray(m.faces)
+            if len(faces) > 20000:
+                idx = np.random.default_rng(0).choice(len(faces), size=20000, replace=False)
+                faces = faces[idx]
+            if hasattr(m.visual, "vertex_colors") and m.visual.vertex_colors is not None:
+                vc = np.asarray(m.visual.vertex_colors)[:, :3] / 255.0
+                colors = vc[faces].mean(axis=1)
         except Exception as e:
             print(f"Could not load {mesh_path} for showcase render ({e}); trying point cloud instead.")
-    if geometry is None and cloud_path:
+            verts = None
+    if verts is None and cloud_path:
         try:
+            import open3d as o3d
+
             pc = o3d.io.read_point_cloud(cloud_path)
-            if len(pc.points) > 0:
-                geometry = pc
+            points = np.asarray(pc.points)
+            point_colors = np.asarray(pc.colors) if pc.has_colors() else None
+            if len(points) > 100_000:
+                idx = np.random.default_rng(0).choice(len(points), size=100_000, replace=False)
+                points = points[idx]
+                if point_colors is not None:
+                    point_colors = point_colors[idx]
         except Exception as e:
             print(f"Could not load {cloud_path} for showcase render ({e}).")
-    if geometry is None:
+    if verts is None and points is None:
         print("Showcase render skipped: nothing loadable.")
         return
 
     try:
-        center = geometry.get_center()
-        extent = np.asarray(geometry.get_max_bound()) - np.asarray(geometry.get_min_bound())
-        radius = float(np.linalg.norm(extent)) or 10.0
-        elevation = radius * 0.6
+        all_pts = verts if verts is not None else points
+        bounds = list(zip((all_pts[:, i].min() for i in range(3)), (all_pts[:, i].max() for i in range(3))))
 
-        renderer = rendering.OffscreenRenderer(640, 480)
-        mat = rendering.MaterialRecord()
-        mat.shader = "defaultLit" if is_mesh else "defaultUnlit"
-        if not is_mesh:
-            try:
-                mat.point_size = 3.0
-            except Exception:
-                pass
-        renderer.scene.add_geometry("geo", geometry, mat)
-        renderer.scene.set_background([0.05, 0.06, 0.08, 1.0])
+        fig = plt.figure(figsize=(6.4, 4.8), dpi=100)
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_facecolor((0.05, 0.06, 0.08))
+        fig.patch.set_facecolor((0.05, 0.06, 0.08))
+        if verts is not None:
+            ax.add_collection3d(Poly3DCollection(
+                verts[faces], facecolor=colors if colors is not None else "#888888", linewidths=0,
+            ))
+        else:
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=point_colors, s=0.5, marker=".")
+        ax.set_xlim(*bounds[0]); ax.set_ylim(*bounds[1]); ax.set_zlim(*bounds[2])
+        ax.set_box_aspect((bounds[0][1] - bounds[0][0], bounds[1][1] - bounds[1][0], bounds[2][1] - bounds[2][0]))
+        ax.axis("off")
 
-        def _snapshot(angle_deg: float):
-            rad = np.radians(angle_deg)
-            eye = center + np.array([radius * np.cos(rad), radius * np.sin(rad), elevation])
-            renderer.scene.camera.look_at(center, eye, up)
-            return np.asarray(renderer.render_to_image())
+        def _snapshot(azim: float) -> np.ndarray:
+            ax.view_init(elev=25, azim=azim)
+            fig.canvas.draw()
+            return np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
 
         print(f"Rendering {n_photos} stills...")
         for angle in np.linspace(0, 360, n_photos, endpoint=False):
-            buf = io.BytesIO()
-            PILImage.fromarray(_snapshot(float(angle))).save(buf, format="PNG")
-            display(IPyImage(data=buf.getvalue()))
+            _snapshot(float(angle))
+            plt.show()
 
         print(f"Rendering a {video_frames}-frame orbit video...")
+        from PIL import Image as PILImage
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             for i in range(video_frames):
-                PILImage.fromarray(_snapshot(360.0 * i / video_frames)).save(tmp_path / f"frame_{i:04d}.png")
+                frame = _snapshot(360.0 * i / video_frames)
+                PILImage.fromarray(frame).save(tmp_path / f"frame_{i:04d}.png")
 
             video_path = tmp_path / "orbit.mp4"
             result = subprocess.run(
@@ -481,9 +498,32 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
                  "-pix_fmt", "yuv420p", str(video_path)],
                 capture_output=True, text=True, timeout=60,
             )
+            plt.close(fig)
             if result.returncode != 0 or not video_path.exists():
                 print(f"Orbit video assembly failed ({result.stderr.strip()[-300:]}); stills above are still available.")
                 return
             display(Video(str(video_path), embed=True, html_attributes="controls loop"))
     except Exception as e:
         print(f"Showcase render failed ({type(e).__name__}: {e}); the downloadable mesh.glb/pointcloud.ply above are still valid.")
+
+
+def render_ground_truth_comparison(artifacts: RunArtifacts) -> None:
+    """Displays the [real photo | reprojected point cloud] comparisons
+    validation.py already rendered to PNG during the run — this just shows
+    them inline and prints the coverage numbers next to each. See
+    validation.py's module docstring for exactly what "coverage" does and
+    doesn't claim to measure."""
+    if not artifacts.comparisons:
+        print("No render-vs-ground-truth comparisons available for this run "
+              "(needs at least one keyframe with a resolved camera pose).")
+        return
+
+    from IPython.display import Image as IPyImage, display
+
+    for comp in artifacts.comparisons:
+        print(f"Frame {comp.frame_index}: {comp.coverage_pct:.0f}% point coverage "
+              f"(fraction of the photo's area a reprojected point landed in — not a pixel-accuracy score)")
+        try:
+            display(IPyImage(filename=comp.image_path))
+        except Exception as e:
+            print(f"  (could not display {comp.image_path}: {e})")

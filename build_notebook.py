@@ -516,19 +516,23 @@ VIEWER_CELL = '''
 # ============================== 3D SHOWCASE ==================================
 # A few stills + a short orbit video rendered straight from the mesh/point
 # cloud, so you can actually SEE the result without leaving the notebook or
-# downloading mesh.glb/pointcloud.ply to a separate viewer. Best-effort —
-# needs a working headless GL context (usually fine on a Kaggle GPU
-# session) and ffmpeg for the video; degrades to a clear message rather
-# than crashing this cell if either isn't available.
+# downloading mesh.glb/pointcloud.ply to a separate viewer — plus a render-
+# vs-ground-truth comparison: the point cloud reprojected into a few real
+# keyframe cameras, next to the actual photo each one captured, with a
+# point-coverage percentage per view. Both best-effort — degrade to a clear
+# message rather than crashing this cell if something's unavailable.
 import importlib
 import sys
 
 sys.path.insert(0, str(CODE_DIR))  # CODE_DIR from the Setup cell above
 import sih3d.stage_views as stage_views_mod
 importlib.reload(stage_views_mod)
-from sih3d.stage_views import render_showcase
+from sih3d.stage_views import render_ground_truth_comparison, render_showcase
 
 render_showcase(pipeline.artifacts)
+
+print("=" * 80); print("RENDER vs GROUND TRUTH"); print("=" * 80)
+render_ground_truth_comparison(pipeline.artifacts)
 '''
 
 

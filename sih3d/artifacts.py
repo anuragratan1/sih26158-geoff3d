@@ -42,8 +42,16 @@ class ChunkGeometrySample:
 
 
 @dataclass
+class ComparisonRecord:
+    frame_index: int
+    coverage_pct: float       # % of the real photo's pixels a reprojected point landed on
+    image_path: str           # side-by-side [real photo | reprojected point splat] PNG
+
+
+@dataclass
 class RunArtifacts:
     keyframes: list[KeyframeRecord] = field(default_factory=list)
+    comparisons: list[ComparisonRecord] = field(default_factory=list)
     gps_track_enu: list[tuple[float, float, float]] = field(default_factory=list)
     camera_track_enu: list[tuple[float, float, float]] = field(default_factory=list)
     collinearity_index: float | None = None

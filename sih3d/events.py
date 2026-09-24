@@ -64,8 +64,18 @@ class EventBus:
         self._lock = threading.Lock()
         self._log_tail: list[str] = []
         self._log_tail_max = 200
+        # Pipeline's watchdog originally only reset its stall clock inside
+        # Pipeline._emit()/_log() — but heartbeat progress from mesh.py's
+        # isolated subprocess helpers publishes straight to this bus (mesh.py
+        # only has the EventBus, not the Pipeline instance), so those
+        # heartbeats updated the visible progress bar but never reset the
+        # watchdog, producing real "no progress" false alarms during steps
+        # that WERE actively reporting progress. Tracking last-activity here
+        # instead means ANY publish (from anywhere) counts as progress.
+        self.last_event_ts: float = time.time()
 
     def publish(self, type: EventType, **payload: Any) -> None:
+        self.last_event_ts = time.time()
         evt = Event(type=type, payload=payload)
         if type == EventType.LOG:
             with self._lock:

@@ -86,7 +86,10 @@ class ConsoleProgress:
             self._phase_t0[phase] = time.time()
         if self._current_phase != phase:
             self._current_phase = phase
-            self._bar.set_description(_PHASE_LABEL.get(phase, phase.replace("_", " ")), refresh=False)
+            # set_description_str, not set_description: the latter appends
+            # its own ": " unconditionally, and _BAR_FORMAT already has one
+            # after {desc} — together they doubled up ("Decoding video: :").
+            self._bar.set_description_str(_PHASE_LABEL.get(phase, phase.replace("_", " ")), refresh=False)
             lo, _ = _PHASE_RANGE.get(phase, (self._progress, 100.0))
             self._set_progress(max(self._progress, lo))
 

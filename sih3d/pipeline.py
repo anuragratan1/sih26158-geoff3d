@@ -333,7 +333,13 @@ class Pipeline:
             if self._current_stage is None:
                 continue
             now = time.time()
-            stalled_s = now - self._last_progress_ts
+            # bus.last_event_ts (not self._last_progress_ts) — heartbeat
+            # progress from mesh.py's isolated subprocess helpers publishes
+            # straight to self.bus, bypassing Pipeline._emit()/_log()
+            # entirely (mesh.py only has the EventBus, not this Pipeline),
+            # so watching only _last_progress_ts produced real "no progress"
+            # false alarms during steps that WERE actively heartbeating.
+            stalled_s = now - self.bus.last_event_ts
             if stalled_s < self.config.watchdog_stall_s:
                 continue
             if now - self._watchdog_last_warn_ts < 30.0:
@@ -549,15 +555,37 @@ class Pipeline:
         except Exception as e:
             self._fallback("mesh_textured_model", e)
 
+        posed_keyframes = [kf for kf in keyframes if getattr(kf, "_resolved_world_pose", None) is not None]
         try:
             if mesh_result.mesh is not None:
                 kf_for_bake = [
                     KeyframeForBaking(image_rgb=kf.image_full, camera_pose_c2w=self._resolved_pose(kf, chunk_idx=None), intrinsics=kf.intrinsics)
-                    for kf in keyframes if getattr(kf, "_resolved_world_pose", None) is not None
+                    for kf in posed_keyframes
                 ]
                 bake_result = mesh_mod.bake_texture(mesh_result.mesh, kf_for_bake, self.bus, time_budget_s=cfg.texture_time_budget_s)
                 if bake_result is not None and bake_result.textured:
                     self._emit(EventType.MESH_PREVIEW, mesh=mesh_result, bake=bake_result, stage="textured")
+        except Exception as e:
+            self._fallback("mesh_textured_model", e)
+
+        try:
+            from .validation import _RenderKeyframe, render_vs_ground_truth
+
+            render_kfs = [
+                _RenderKeyframe(
+                    frame_index=kf.frame_index, image_rgb=kf.image_full,
+                    camera_pose_c2w=self._resolved_pose(kf, chunk_idx=None), intrinsics=kf.intrinsics,
+                )
+                for kf in posed_keyframes
+            ]
+            self.artifacts.comparisons = render_vs_ground_truth(cloud.points, cloud.colors, render_kfs, cfg.output_dir, self.bus)
+            for comp in self.artifacts.comparisons:
+                path = Path(comp.image_path)
+                status = export.ExportStatus(
+                    name=path.name, path=path, ok=True, size_bytes=path.stat().st_size if path.exists() else 0,
+                )
+                self._export_statuses.append(status)
+                self.artifacts.output_paths[status.name] = str(path)
         except Exception as e:
             self._fallback("mesh_textured_model", e)
         self._emit(EventType.STAGE_DONE, stage="mesh_textured_model")
