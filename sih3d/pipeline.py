@@ -69,7 +69,7 @@ from .events import Event, EventBus, EventType
 from .fusion import FusedPointCloud, VoxelPointFusion, remove_statistical_outliers
 from .gpu_monitor import GpuMonitor
 from .io_detect import DetectedInputs
-from .keyframes import select_keyframes
+from .keyframes import compute_sharpness, select_keyframes
 from .mesh import KeyframeForBaking
 from .report import ReportBuilder
 from .telemetry import (
@@ -539,7 +539,16 @@ class Pipeline:
             raw_indices.append(idx)
             raw_ts.append(t)
             raw_frames.append(frame)
-            self._emit(EventType.FRAME_DECODED, frame=frame, frame_index=idx, sharpness=0.0)
+            # A real per-frame score, not a placeholder — the frames panel
+            # used to always show "sharpness=0" here because the actual
+            # accept/reject scoring happens afterward in one GPU batch over
+            # ALL collected frames (select_keyframes below), not per frame
+            # as each is decoded. This single-frame call is cheap (frames
+            # are already scale_width-limited) and purely for the live
+            # display; select_keyframes' batch scores are still what
+            # decides acceptance.
+            live_sharpness = compute_sharpness(frame, device=cfg.device0 if "cuda" in cfg.device0 else "cpu")
+            self._emit(EventType.FRAME_DECODED, frame=frame, frame_index=idx, sharpness=live_sharpness)
             if cfg.mode == "QUICK" and len(raw_frames) >= cfg.quick_max_keyframes * 4:
                 break  # decode a bounded multiple of the target count; selection will thin it out
 

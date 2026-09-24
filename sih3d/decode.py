@@ -68,11 +68,53 @@ class FrameDecoder:
         except Exception as e:
             self.bus.log(f"PyNvVideoCodec unavailable ({e}); trying ffmpeg -hwaccel cuda", level="warn")
 
-        if self._ffmpeg_has_cuda_hwaccel():
+        if self._ffmpeg_has_cuda_hwaccel() and self._verify_ffmpeg_cuda():
             return DecoderInfo(backend="ffmpeg_cuda", device=self.device)
 
         self.bus.log("No GPU decode path available; falling back to CPU decode", level="warn")
         return DecoderInfo(backend="cpu", device="cpu")
+
+    def _verify_ffmpeg_cuda(self, n_probe: int = 30, min_fps_4k: float = 60.0, min_fps_other: float = 24.0) -> bool:
+        """`ffmpeg -hwaccels` listing "cuda" only means ffmpeg was compiled
+        with CUDA hwaccel support — not that NVDEC actually engages at
+        runtime for this codec/driver/container. ffmpeg can silently fall
+        back to software decode on a hwaccel init failure rather than
+        erroring, which looks identical to a slow-but-working GPU path
+        from the caller's side (this is exactly what a real run showed:
+        CPU pegged, GPU idle, frame extraction crawling, with the log
+        confidently claiming "ffmpeg_cuda"). Same principle as
+        _verify_torchcodec_gpu above: actually decode and measure, don't
+        trust the capability check alone."""
+        try:
+            w, h, native_fps = self._probe_dims()
+            min_fps = min_fps_4k if max(w, h) >= 3000 else min_fps_other
+            probe_end_s = n_probe / max(native_fps, 1.0)
+
+            t0 = time.time()
+            count = 0
+            for _ in self._iter_ffmpeg(0.0, probe_end_s, stride=1, hwaccel=True, allow_fallback=False):
+                count += 1
+                if count >= n_probe:
+                    break
+            elapsed = time.time() - t0
+            fps = count / elapsed if elapsed > 0 else 0.0
+
+            if count == 0:
+                self.bus.log("ffmpeg -hwaccel cuda produced no frames during verification — using CPU decode instead", level="warn")
+                return False
+            if fps < min_fps:
+                self.bus.log(
+                    f"ffmpeg -hwaccel cuda measured only {fps:.1f} fps over {count} frames at {w}x{h} "
+                    f"(below the {min_fps:.0f} fps floor — hwaccel likely silently fell back to software) — "
+                    f"using CPU decode instead", level="warn",
+                )
+                return False
+
+            self.bus.log(f"ffmpeg -hwaccel cuda verified: {fps:.1f} fps over {count} real frames at {w}x{h}")
+            return True
+        except Exception as e:
+            self.bus.log(f"ffmpeg -hwaccel cuda verification failed ({e}) — using CPU decode instead", level="warn")
+            return False
 
     def _verify_torchcodec_gpu(self, n_probe: int = 30, min_fps_4k: float = 60.0, min_fps_other: float = 24.0) -> DecoderInfo | None:
         """Decodes a handful of real frames and checks BOTH that they
@@ -199,7 +241,7 @@ class FrameDecoder:
             self.bus.log(f"PyNvVideoCodec path failed at runtime ({e}); falling back to CPU decode", level="warn")
             yield from self._iter_ffmpeg(start_s, end_s, stride, hwaccel=False, target_fps=target_fps, scale_width=scale_width)
 
-    def _iter_ffmpeg(self, start_s, end_s, stride, hwaccel: bool, target_fps=None, scale_width=None):
+    def _iter_ffmpeg(self, start_s, end_s, stride, hwaccel: bool, target_fps=None, scale_width=None, allow_fallback: bool = True):
         import subprocess
 
         w, h, native_fps = self._probe_dims()
@@ -255,9 +297,17 @@ class FrameDecoder:
             proc.wait(timeout=10)
             if proc.returncode not in (0, None) and proc.returncode != 0:
                 err = proc.stderr.read().decode("utf-8", "ignore")[-2000:]
-                if hwaccel:
+                if hwaccel and allow_fallback:
                     self.bus.log(f"ffmpeg CUDA decode failed ({err.strip()[-300:]}); retrying with CPU decode", level="warn")
                     yield from self._iter_ffmpeg(start_s, end_s, stride, hwaccel=False, target_fps=target_fps, scale_width=scale_width)
+                elif hwaccel:
+                    # allow_fallback=False: used only by _verify_ffmpeg_cuda's
+                    # probe, which needs to know hwaccel itself failed rather
+                    # than silently receiving CPU-decoded frames it would
+                    # mistake for fast GPU decode (confirmed by testing: the
+                    # auto-fallback above measured 350+ fps on a failed probe
+                    # because those frames were actually from the CPU retry).
+                    self.bus.log(f"ffmpeg CUDA decode failed during verification ({err.strip()[-300:]})", level="warn")
 
     def _probe_dims(self) -> tuple[int, int, float]:
         from .io_detect import probe_video
