@@ -355,26 +355,10 @@ class Pipeline:
         if video is None:
             raise RuntimeError("no video detected — nothing to process")
 
-        # Backbone selection is the one allowed-fatal setup step.
-        if self._backbone_override is not None:
-            bb, prior_mode = self._backbone_override
-        else:
-            bb, prior_mode = backbone_mod.select_backbone(
-                cfg.backbone_choice, cfg.prior_mode, self.detected, self.bus,
-                device=cfg.device0, use_finetuned=cfg.use_finetuned,
-            )
-        self.georeferenced = self.georeferenced and bb.name != "?" and prior_mode is not None
-        # select_backbone already forces C/RGB when there's no telemetry;
-        # re-derive georeferenced from what it actually decided, not our
-        # own earlier guess.
+        # georeferenced only depends on what was detected, not on the
+        # backbone — resolved here so frame_extraction/camera_trajectory
+        # below can use it without the backbone needing to exist yet.
         self.georeferenced = self.detected.telemetry_path is not None or self.detected.telemetry_kind == "embedded"
-        if bb.name == "C" and prior_mode == PriorMode.RGB and not self.georeferenced:
-            pass  # expected no-GPS path
-        self.report.set_run_config(
-            mode=cfg.mode, backbone=bb.name, prior_mode=prior_mode.value,
-            checkpoint_source=getattr(bb, "checkpoint_source", "pretrained"),
-            gpus=self.gpu_monitor.device_names,
-        )
         if not self.georeferenced:
             self._log("NO TELEMETRY: outputs will be APPROXIMATE SCALE — NOT GEOREFERENCED", level="warn")
 
@@ -382,6 +366,16 @@ class Pipeline:
             self.masker = masks.DynamicObjectMasker(self.bus, device=cfg.device1)
 
         # -- Stage: frame_extraction -------------------------------------
+        # Backbone selection/loading is deliberately NOT done before this
+        # stage (it used to be) — a first real Kaggle run OOM'd here: with
+        # MapAnything already resident on device0 (~13.7 of a 14.6 GiB T4),
+        # frame extraction's own sharpness-scoring batch (all candidate
+        # frames as one tensor, also on device0) had nowhere near enough
+        # headroom left. Frame extraction and camera_trajectory use
+        # neither the backbone nor its device, so loading it only right
+        # before the chunk loop that actually needs it — after chunking,
+        # below — means it competes for GPU0 memory with nothing but
+        # itself.
         self._emit(EventType.STAGE_START, stage="frame_extraction")
         try:
             keyframes = self._extract_keyframes(video)
@@ -415,6 +409,25 @@ class Pipeline:
         # -- Chunking --------------------------------------------------------
         chunks = self._make_chunks(keyframes)
         self._log(f"Chunked {len(keyframes)} keyframes into {len(chunks)} chunk(s) (size={cfg.chunk_size}, overlap={cfg.chunk_overlap})")
+
+        # Backbone selection is the one allowed-fatal setup step, and the
+        # only thing here allowed to put multi-GB of weights on device0 —
+        # deliberately done only now, right before the chunk loop that's
+        # the first thing to actually need it (see the frame_extraction
+        # comment above for why: it used to run before frame extraction
+        # and OOM'd there on a real 4K Kaggle run).
+        if self._backbone_override is not None:
+            bb, prior_mode = self._backbone_override
+        else:
+            bb, prior_mode = backbone_mod.select_backbone(
+                cfg.backbone_choice, cfg.prior_mode, self.detected, self.bus,
+                device=cfg.device0, use_finetuned=cfg.use_finetuned,
+            )
+        self.report.set_run_config(
+            mode=cfg.mode, backbone=bb.name, prior_mode=prior_mode.value,
+            checkpoint_source=getattr(bb, "checkpoint_source", "pretrained"),
+            gpus=self.gpu_monitor.device_names,
+        )
 
         self._gpu1_thread = None
         if self.two_gpu:

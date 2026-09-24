@@ -67,11 +67,27 @@ def compute_sharpness(frame_hwc: np.ndarray, device: str = "cpu") -> float:
     return float(_laplacian_variance_batch(t).item())
 
 
-def compute_sharpness_batch(frames_nhwc: np.ndarray, device: str = "cpu") -> np.ndarray:
+def compute_sharpness_batch(frames_nhwc: np.ndarray, device: str = "cpu", batch_size: int = 32) -> np.ndarray:
+    """Batches the GPU upload/cast instead of putting the whole candidate
+    set on the device as one tensor — a real Kaggle run OOM'd here on a 4K
+    video: casting a few hundred full-resolution frames to float32 on the
+    same device the geometry backbone's weights already occupy needed
+    several more GB than was left (each frame at scale_width=1920 is
+    already ~6MB as uint8, ~24MB once cast to float32; hundreds of those
+    at once adds up fast regardless of what else is resident on the GPU).
+    Batching bounds peak memory to one batch's size no matter how many
+    candidates there are in total."""
     import torch
 
-    t = torch.from_numpy(frames_nhwc).to(device)
-    return _laplacian_variance_batch(t).cpu().numpy()
+    n = len(frames_nhwc)
+    if n == 0:
+        return np.zeros((0,), dtype=np.float32)
+    out = np.empty((n,), dtype=np.float32)
+    for i in range(0, n, batch_size):
+        t = torch.from_numpy(frames_nhwc[i:i + batch_size]).to(device)
+        out[i:i + batch_size] = _laplacian_variance_batch(t).cpu().numpy()
+        del t
+    return out
 
 
 def _haversine_like_enu_distance(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
