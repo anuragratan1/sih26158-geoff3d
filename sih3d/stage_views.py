@@ -439,11 +439,22 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
             verts = None
     if verts is None and cloud_path:
         try:
-            import open3d as o3d
+            # trimesh, not Open3D: a plain PLY point cloud (no faces) loads
+            # as a trimesh.PointCloud with no GPU/rendering backend touched
+            # at all — Open3D's import alone was enough to trip the exact
+            # "Failed to load vulkan library!" this function exists to
+            # avoid (its Jupyter-environment auto-detection eagerly
+            # initializes the Filament/Vulkan-based renderer on import,
+            # regardless of whether anything then actually asks it to
+            # render), so it has no business being imported in this
+            # function at all, not even for pure point-cloud I/O.
+            import trimesh
 
-            pc = o3d.io.read_point_cloud(cloud_path)
-            points = np.asarray(pc.points)
-            point_colors = np.asarray(pc.colors) if pc.has_colors() else None
+            pc = trimesh.load(cloud_path, process=False)
+            points = np.asarray(pc.vertices)
+            point_colors = None
+            if hasattr(pc, "colors") and pc.colors is not None and len(pc.colors):
+                point_colors = np.asarray(pc.colors)[:, :3] / 255.0
             if len(points) > 100_000:
                 idx = np.random.default_rng(0).choice(len(points), size=100_000, replace=False)
                 points = points[idx]
