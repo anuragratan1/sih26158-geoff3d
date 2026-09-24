@@ -513,7 +513,7 @@ for status in getattr(pipeline, "_export_statuses", []):
 '''
 
 VIEWER_CELL = '''
-# ============================== 3D SHOWCASE ==================================
+# ==================== 3D SHOWCASE + RENDER vs GROUND TRUTH ===================
 # A few stills + a short orbit video rendered straight from the mesh/point
 # cloud, so you can actually SEE the result without leaving the notebook or
 # downloading mesh.glb/pointcloud.ply to a separate viewer — plus a render-
