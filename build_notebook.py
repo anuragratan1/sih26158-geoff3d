@@ -513,25 +513,40 @@ for status in getattr(pipeline, "_export_statuses", []):
 '''
 
 VIEWER_CELL = '''
-# ==================== 3D SHOWCASE + RENDER vs GROUND TRUTH ===================
+# ============================== 3D SHOWCASE ==================================
 # A few stills + a short orbit video rendered straight from the mesh/point
 # cloud, so you can actually SEE the result without leaving the notebook or
-# downloading mesh.glb/pointcloud.ply to a separate viewer — plus a render-
-# vs-ground-truth comparison: the point cloud reprojected into a few real
-# keyframe cameras, next to the actual photo each one captured, with a
-# point-coverage percentage per view. Both best-effort — degrade to a clear
-# message rather than crashing this cell if something's unavailable.
+# downloading mesh.glb/pointcloud.ply to a separate viewer. Best-effort —
+# degrades to a clear message rather than crashing this cell if something's
+# unavailable. Separate cell from the ground-truth comparison below: a
+# combined cell's output got long enough (stills + video + 3 comparison
+# figures) to risk Kaggle truncating it, and each is easier to find on its
+# own anyway.
 import importlib
 import sys
 
 sys.path.insert(0, str(CODE_DIR))  # CODE_DIR from the Setup cell above
 import sih3d.stage_views as stage_views_mod
 importlib.reload(stage_views_mod)
-from sih3d.stage_views import render_ground_truth_comparison, render_showcase
+from sih3d.stage_views import render_showcase
 
 render_showcase(pipeline.artifacts)
+'''
 
-print("=" * 80); print("RENDER vs GROUND TRUTH"); print("=" * 80)
+GROUND_TRUTH_CELL = '''
+# ============================== RENDER vs GROUND TRUTH =======================
+# The point cloud reprojected into a few real keyframe cameras (their
+# actual estimated pose + intrinsics), next to the real photo each one
+# captured, with a point-coverage percentage per view — see validation.py
+# for exactly what "coverage" does and doesn't measure.
+import importlib
+import sys
+
+sys.path.insert(0, str(CODE_DIR))  # CODE_DIR from the Setup cell above
+import sih3d.stage_views as stage_views_mod
+importlib.reload(stage_views_mod)
+from sih3d.stage_views import render_ground_truth_comparison
+
 render_ground_truth_comparison(pipeline.artifacts)
 '''
 
@@ -540,7 +555,7 @@ def build() -> None:
     nb = nbf.v4.new_notebook()
     cells = [
         md(TITLE_MD), code(CONFIG_CELL), code(SETUP_CELL), md(CACHE_SAVE_NOTE_MD),
-        code(LAUNCH_CELL), code(RESULTS_CELL), code(VIEWER_CELL),
+        code(LAUNCH_CELL), code(RESULTS_CELL), code(VIEWER_CELL), code(GROUND_TRUTH_CELL),
     ]
 
     nb["cells"] = cells

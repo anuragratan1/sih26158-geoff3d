@@ -92,7 +92,15 @@ def render_vs_ground_truth(
             # reconstruction; coarse bins measure "did geometry reach this
             # region of frame," which is what a point splat can honestly say.
             bin_px = 64
-            bins_x, bins_y = max(1, w // bin_px), max(1, h // bin_px)
+            # Ceiling division, not floor: floor(w // bin_px) undercounts
+            # the true number of reachable bins whenever w/h isn't an exact
+            # multiple of bin_px (e.g. w=2560 gives bins_x=40 exactly, but
+            # h=1440 gives floor(1440/64)=22 while a point can still land in
+            # bin index 22 — the partial last bin — pushing hit_bins past
+            # the undercounted denominator and coverage over 100%, which is
+            # a nonsense value for a percentage. This was a real observed
+            # bug: a run reported "106% coverage".
+            bins_x, bins_y = max(1, -(-w // bin_px)), max(1, -(-h // bin_px))
             hit_bins = set(zip((vis_x // bin_px).astype(int), (vis_y // bin_px).astype(int)))
             coverage_pct = 100.0 * len(hit_bins) / (bins_x * bins_y)
 

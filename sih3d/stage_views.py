@@ -382,7 +382,7 @@ def render_final_summary(report: ReportBuilder) -> None:
             print(" -", f)
 
 
-def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: int = 36, video_fps: int = 12) -> None:
+def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: int = 90, video_fps: int = 15) -> None:
     """Best-effort: a few stills + a short orbit video rendered straight
     from the reconstructed mesh (falls back to the point cloud if no mesh
     was produced), displayed inline so there's something to actually look
@@ -496,7 +496,7 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
             # near-black background was nearly invisible.
             point_c = point_colors if point_colors is not None else points[:, 2]
             point_cmap = None if point_colors is not None else "viridis"
-            ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=point_c, cmap=point_cmap, s=2.5, marker=".", depthshade=False)
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=point_c, cmap=point_cmap, s=4.0, marker=".", depthshade=True)
         ax.set_xlim(*bounds[0]); ax.set_ylim(*bounds[1]); ax.set_zlim(*bounds[2])
         ax.set_box_aspect((bounds[0][1] - bounds[0][0], bounds[1][1] - bounds[1][0], bounds[2][1] - bounds[2][0]))
         ax.axis("off")
