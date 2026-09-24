@@ -203,6 +203,52 @@ def export_mesh_glb(mesh_result: MeshResult, bake: TextureBakeResult | None, out
     return ExportStatus(name="mesh.glb", path=out_path, ok=True, size_bytes=size, timing_s=time.time() - t0)
 
 
+def export_mesh_ply(mesh_result: MeshResult, bake: TextureBakeResult | None, out_path: Path, bus: EventBus) -> ExportStatus:
+    """Vertex-colored PLY — opens directly in MeshLab/CloudCompare/Blender
+    with no plugins, useful for a quick local preview off Kaggle without
+    needing a glTF-aware viewer. PLY has no UV-texture-image concept the
+    way glb/obj do, so a successful bake's real photo texture is baked
+    into per-vertex colors first (to_color()) rather than silently
+    reverting to the pre-bake flat vertex-colored mesh."""
+    t0 = time.time()
+    if mesh_result.mesh is None:
+        return ExportStatus(name="mesh.ply", path=None, ok=False, skipped_reason="no mesh")
+
+    try:
+        import trimesh
+    except Exception as e:
+        bus.log(f"trimesh not available ({e}) — mesh.ply skipped", level="warn")
+        return ExportStatus(name="mesh.ply", path=None, ok=False, skipped_reason=str(e))
+
+    mesh = mesh_result.mesh
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+
+    if bake is not None and bake.textured:
+        from PIL import Image
+
+        uv = bake.uv.reshape(-1, 3, 2)
+        flat_vertices = vertices[triangles].reshape(-1, 3)
+        flat_uv = uv.reshape(-1, 2)
+        flat_faces = np.arange(len(flat_vertices)).reshape(-1, 3)
+        material = trimesh.visual.material.PBRMaterial(baseColorTexture=Image.fromarray(bake.texture_rgb))
+        visual = trimesh.visual.TextureVisuals(uv=flat_uv, material=material)
+        tm = trimesh.Trimesh(vertices=flat_vertices, faces=flat_faces, visual=visual, process=False)
+        try:
+            tm.visual = tm.visual.to_color()
+        except Exception as e:
+            bus.log(f"Could not bake texture into vertex colors for mesh.ply ({e}); exporting untextured", level="warn")
+    else:
+        colors = np.asarray(mesh.vertex_colors) if mesh.has_vertex_colors() else None
+        vertex_colors = (np.clip(colors, 0, 1) * 255).astype(np.uint8) if colors is not None else None
+        tm = trimesh.Trimesh(vertices=vertices, faces=triangles, vertex_colors=vertex_colors, process=False)
+
+    tm.export(str(out_path))
+    size = out_path.stat().st_size
+    bus.log(f"Wrote {out_path.name} ({size / 1e6:.1f} MB)")
+    return ExportStatus(name="mesh.ply", path=out_path, ok=True, size_bytes=size, timing_s=time.time() - t0)
+
+
 def export_mesh_fbx(obj_path: Path | None, out_path: Path, bus: EventBus) -> ExportStatus:
     """Best-effort only, per the task spec — assimp via apt/CLI. Logs
     clearly and never raises if assimp isn't installed or the conversion

@@ -568,26 +568,6 @@ class Pipeline:
         except Exception as e:
             self._fallback("mesh_textured_model", e)
 
-        try:
-            from .validation import _RenderKeyframe, render_vs_ground_truth
-
-            render_kfs = [
-                _RenderKeyframe(
-                    frame_index=kf.frame_index, image_rgb=kf.image_full,
-                    camera_pose_c2w=self._resolved_pose(kf, chunk_idx=None), intrinsics=kf.intrinsics,
-                )
-                for kf in posed_keyframes
-            ]
-            self.artifacts.comparisons = render_vs_ground_truth(cloud.points, cloud.colors, render_kfs, cfg.output_dir, self.bus)
-            for comp in self.artifacts.comparisons:
-                path = Path(comp.image_path)
-                status = export.ExportStatus(
-                    name=path.name, path=path, ok=True, size_bytes=path.stat().st_size if path.exists() else 0,
-                )
-                self._export_statuses.append(status)
-                self.artifacts.output_paths[status.name] = str(path)
-        except Exception as e:
-            self._fallback("mesh_textured_model", e)
         self._emit(EventType.STAGE_DONE, stage="mesh_textured_model")
 
         self.artifacts.mesh_n_vertices = mesh_result.n_vertices
@@ -601,6 +581,40 @@ class Pipeline:
 
         # -- Export ------------------------------------------------------
         self._export_all(cloud, mesh_result, bake_result, keyframes)
+
+        # -- Render-vs-ground-truth comparison -----------------------------
+        # Runs AFTER export, not before: bake_texture() never modifies
+        # mesh_result.mesh in place (it returns a separate TextureBakeResult
+        # with its own atlas image + UVs) — the geometry and the baked
+        # texture only actually get combined into one object when
+        # export_mesh_glb() writes mesh.glb, so reading mesh_result.mesh
+        # directly here would always show the pre-bake vertex-colored mesh,
+        # silently ignoring a successful bake. Reading the exported GLB
+        # file (same as stage_views.render_showcase) is what actually shows
+        # the final polished mesh a bake produced.
+        try:
+            from .validation import _RenderKeyframe, render_vs_ground_truth
+
+            render_kfs = [
+                _RenderKeyframe(
+                    frame_index=kf.frame_index, image_rgb=kf.image_full,
+                    camera_pose_c2w=self._resolved_pose(kf, chunk_idx=None), intrinsics=kf.intrinsics,
+                )
+                for kf in posed_keyframes
+            ]
+            self.artifacts.comparisons = render_vs_ground_truth(
+                cloud.points, cloud.colors, render_kfs, cfg.output_dir, self.bus,
+                mesh_glb_path=self.artifacts.output_paths.get("mesh.glb"),
+            )
+            for comp in self.artifacts.comparisons:
+                path = Path(comp.image_path)
+                status = export.ExportStatus(
+                    name=path.name, path=path, ok=True, size_bytes=path.stat().st_size if path.exists() else 0,
+                )
+                self._export_statuses.append(status)
+                self.artifacts.output_paths[status.name] = str(path)
+        except Exception as e:
+            self._fallback("mesh_textured_model", e)
 
     # -- frame extraction / keyframes --------------------------------------
 
@@ -1188,6 +1202,7 @@ class Pipeline:
         rec(obj_status)
         glb_status = export.export_mesh_glb(mesh_result, bake_result, out / "mesh.glb", self.bus)
         rec(glb_status)
+        rec(export.export_mesh_ply(mesh_result, bake_result, out / "mesh.ply", self.bus))
         rec(export.export_mesh_fbx(obj_status.path, out / "mesh.fbx", self.bus))
 
         dsm_status, ortho_status = export.export_dsm_orthomosaic(cloud, out, self.bus, self.epsg, self.georeferenced, cfg.dsm_cell_size_m)

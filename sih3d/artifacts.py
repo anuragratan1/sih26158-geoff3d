@@ -44,8 +44,9 @@ class ChunkGeometrySample:
 @dataclass
 class ComparisonRecord:
     frame_index: int
-    coverage_pct: float       # % of the real photo's pixels a reprojected point landed on
-    image_path: str           # side-by-side [real photo | reprojected point splat] PNG
+    point_coverage_pct: float | None   # coarse-bin % of frame a reprojected point landed in, or None if no points were visible
+    mesh_coverage_pct: float | None    # % of frame the rendered mesh surface reached, or None if no mesh was available/renderable
+    image_path: str                     # 3-panel [real photo | point cloud | mesh render] PNG
 
 
 @dataclass

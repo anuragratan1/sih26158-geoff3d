@@ -382,6 +382,109 @@ def render_final_summary(report: ReportBuilder) -> None:
             print(" -", f)
 
 
+def _make_pyrender_snapshot(verts, faces, colors, points, point_colors, bounds, width: int = 640, height: int = 480):
+    """GPU-accelerated offscreen render via pyrender's EGL backend — real
+    lighting/shading on an actual triangle mesh (or a proper point
+    renderer, not a flat matplotlib scatter). EGL, not Vulkan: EGL is the
+    standard headless-GPU-rendering path used across ML/robotics tooling
+    on cloud GPU boxes and needs only the NVIDIA driver's existing EGL
+    library, no display server and no Vulkan loader — Open3D's
+    rendering.OffscreenRenderer needs Vulkan specifically (Filament), which
+    errored out on a real Kaggle session ("Failed to load vulkan
+    library!"). Returns (None, no-op) on ANY failure — missing package,
+    missing EGL, a context that fails on its first real render — so the
+    caller can fall back to the matplotlib path without this being fatal.
+    """
+    try:
+        import os
+        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+        import pyrender
+        import trimesh as _trimesh
+
+        scene = pyrender.Scene(bg_color=[0.05, 0.06, 0.08, 1.0], ambient_light=[0.35, 0.35, 0.35])
+        if verts is not None:
+            tm = _trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+            if colors is not None:
+                rgba = np.concatenate([np.clip(colors, 0, 1), np.ones((len(colors), 1))], axis=1)
+                tm.visual.face_colors = (rgba * 255).astype(np.uint8)
+            geom = pyrender.Mesh.from_trimesh(tm, smooth=False)
+        else:
+            rgba = None
+            if point_colors is not None:
+                rgba = np.concatenate([point_colors, np.ones((len(point_colors), 1))], axis=1)
+            geom = pyrender.Mesh.from_points(points, colors=rgba)
+        scene.add(geom)
+
+        center = np.array([(b[0] + b[1]) / 2.0 for b in bounds])
+        radius = float(np.linalg.norm([b[1] - b[0] for b in bounds])) or 10.0
+        elevation = radius * 0.5
+        up = np.array([0.0, 0.0, 1.0])  # ENU: Z is up (see viewer.py/telemetry.py)
+
+        def _look_at(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
+            # Standard OpenGL camera-to-world: camera looks down its own
+            # -Z, +Y up, +X right — the convention pyrender/glTF expects.
+            forward = target - eye
+            forward = forward / (np.linalg.norm(forward) or 1.0)
+            right = np.cross(forward, up)
+            right = right / (np.linalg.norm(right) or 1.0)
+            true_up = np.cross(right, forward)
+            pose = np.eye(4)
+            pose[:3, 0], pose[:3, 1], pose[:3, 2], pose[:3, 3] = right, true_up, -forward, eye
+            return pose
+
+        camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0, aspectRatio=width / height)
+        cam_node = scene.add(camera, pose=np.eye(4))
+        light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=4.0)
+        light_node = scene.add(light, pose=np.eye(4))
+        renderer = pyrender.OffscreenRenderer(width, height)
+
+        def _snapshot(azim_deg: float) -> np.ndarray:
+            rad = np.radians(azim_deg)
+            eye = center + np.array([radius * np.cos(rad), radius * np.sin(rad), elevation])
+            pose = _look_at(eye, center)
+            scene.set_pose(cam_node, pose)
+            scene.set_pose(light_node, pose)
+            color, _depth = renderer.render(scene)
+            return color
+
+        _snapshot(0.0)  # force a real render now — surfaces EGL/context failures here, not mid-video
+        return _snapshot, renderer.delete
+    except Exception:
+        return None, (lambda: None)
+
+
+def _make_matplotlib_snapshot(verts, faces, colors, points, point_colors, bounds, plt, Poly3DCollection):
+    """Flat-shaded fallback with no GPU rendering backend at all. See
+    render_showcase's docstring for why mplot3d's view_init needs no
+    separate "camera up" vector the way pyrender/any real camera does."""
+    fig = plt.figure(figsize=(6.4, 4.8), dpi=100)
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)  # no border padding around the 3D axes
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_facecolor((0.05, 0.06, 0.08))
+    fig.patch.set_facecolor((0.05, 0.06, 0.08))
+    if verts is not None:
+        ax.add_collection3d(Poly3DCollection(
+            verts[faces], facecolor=colors if colors is not None else "#888888", linewidths=0,
+        ))
+    else:
+        # No stored color -> color by height (z) instead of matplotlib's
+        # single flat default color, which at a small marker size on a
+        # near-black background was nearly invisible.
+        point_c = point_colors if point_colors is not None else points[:, 2]
+        point_cmap = None if point_colors is not None else "viridis"
+        ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=point_c, cmap=point_cmap, s=4.0, marker=".", depthshade=True)
+    ax.set_xlim(*bounds[0]); ax.set_ylim(*bounds[1]); ax.set_zlim(*bounds[2])
+    ax.set_box_aspect((bounds[0][1] - bounds[0][0], bounds[1][1] - bounds[1][0], bounds[2][1] - bounds[2][0]))
+    ax.axis("off")
+
+    def _snapshot(azim: float) -> np.ndarray:
+        ax.view_init(elev=25, azim=azim)
+        fig.canvas.draw()
+        return np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+
+    return _snapshot, (lambda: plt.close(fig))
+
+
 def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: int = 90, video_fps: int = 15) -> None:
     """Best-effort: a few stills + a short orbit video rendered straight
     from the reconstructed mesh (falls back to the point cloud if no mesh
@@ -427,6 +530,20 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
             m = trimesh.load(mesh_path, process=False)
             if hasattr(m, "geometry"):  # a Scene (e.g. GLB) — take the first mesh
                 m = next(iter(m.geometry.values()))
+            # A successfully-baked mesh stores its real photo texture as a
+            # UV-mapped image (trimesh.visual.TextureVisuals), not vertex
+            # colors — reading only `.vertex_colors` silently threw away
+            # the actual baked texture whenever baking succeeded and fell
+            # back to whatever default gray vertex colors trimesh makes up
+            # for a texture-only mesh. to_color() bakes the real texture
+            # into real per-vertex colors first, so "the polished mesh"
+            # (texture-baked when available) is what actually gets shown,
+            # not silently the pre-baking vertex-colored version.
+            if hasattr(m.visual, "to_color"):
+                try:
+                    m.visual = m.visual.to_color()
+                except Exception:
+                    pass
             verts, faces = np.asarray(m.vertices), np.asarray(m.faces)
             if len(faces) > 20000:
                 idx = np.random.default_rng(0).choice(len(faces), size=20000, replace=False)
@@ -481,35 +598,21 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
         lo, hi = lo - pad, hi + pad
         bounds = list(zip(lo, hi))
 
-        fig = plt.figure(figsize=(6.4, 4.8), dpi=100)
-        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)  # no border padding around the 3D axes
-        ax = fig.add_subplot(111, projection="3d")
-        ax.set_facecolor((0.05, 0.06, 0.08))
-        fig.patch.set_facecolor((0.05, 0.06, 0.08))
-        if verts is not None:
-            ax.add_collection3d(Poly3DCollection(
-                verts[faces], facecolor=colors if colors is not None else "#888888", linewidths=0,
-            ))
+        _snapshot, cleanup = _make_pyrender_snapshot(verts, faces, colors, points, point_colors, bounds)
+        if _snapshot is not None:
+            print("Rendering via pyrender (GPU, EGL) — real lit/shaded geometry.")
         else:
-            # No stored color -> color by height (z) instead of matplotlib's
-            # single flat default color, which at a small marker size on a
-            # near-black background was nearly invisible.
-            point_c = point_colors if point_colors is not None else points[:, 2]
-            point_cmap = None if point_colors is not None else "viridis"
-            ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=point_c, cmap=point_cmap, s=4.0, marker=".", depthshade=True)
-        ax.set_xlim(*bounds[0]); ax.set_ylim(*bounds[1]); ax.set_zlim(*bounds[2])
-        ax.set_box_aspect((bounds[0][1] - bounds[0][0], bounds[1][1] - bounds[1][0], bounds[2][1] - bounds[2][0]))
-        ax.axis("off")
-
-        def _snapshot(azim: float) -> np.ndarray:
-            ax.view_init(elev=25, azim=azim)
-            fig.canvas.draw()
-            return np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+            print("pyrender/EGL unavailable; falling back to matplotlib (flat-shaded, no GPU renderer needed).")
+            _snapshot, cleanup = _make_matplotlib_snapshot(verts, faces, colors, points, point_colors, bounds, plt, Poly3DCollection)
 
         print(f"Rendering {n_photos} stills...")
         for angle in np.linspace(0, 360, n_photos, endpoint=False):
-            _snapshot(float(angle))
+            frame = _snapshot(float(angle))
+            plt.figure(figsize=(6.4, 4.8), dpi=100)
+            plt.imshow(frame)
+            plt.axis("off")
             plt.show()
+            plt.close()
 
         print(f"Rendering a {video_frames}-frame orbit video...")
         from PIL import Image as PILImage
@@ -526,7 +629,7 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
                  "-pix_fmt", "yuv420p", str(video_path)],
                 capture_output=True, text=True, timeout=60,
             )
-            plt.close(fig)
+            cleanup()
             if result.returncode != 0 or not video_path.exists():
                 print(f"Orbit video assembly failed ({result.stderr.strip()[-300:]}); stills above are still available.")
                 return
@@ -536,7 +639,7 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
 
 
 def render_ground_truth_comparison(artifacts: RunArtifacts) -> None:
-    """Displays the [real photo | reprojected point cloud] comparisons
+    """Displays the 3-panel [real photo | point cloud | mesh] comparisons
     validation.py already rendered to PNG during the run — this just shows
     them inline and prints the coverage numbers next to each. See
     validation.py's module docstring for exactly what "coverage" does and
@@ -549,8 +652,10 @@ def render_ground_truth_comparison(artifacts: RunArtifacts) -> None:
     from IPython.display import Image as IPyImage, display
 
     for comp in artifacts.comparisons:
-        print(f"Frame {comp.frame_index}: {comp.coverage_pct:.0f}% point coverage "
-              f"(fraction of the photo's area a reprojected point landed in — not a pixel-accuracy score)")
+        pc = f"{comp.point_coverage_pct:.0f}%" if comp.point_coverage_pct is not None else "n/a"
+        mc = f"{comp.mesh_coverage_pct:.0f}%" if comp.mesh_coverage_pct is not None else "n/a (no mesh this run)"
+        print(f"Frame {comp.frame_index}: point cloud coverage {pc}, mesh coverage {mc} "
+              f"(coverage = fraction of the photo's area the geometry actually reached — not a pixel-accuracy score)")
         try:
             display(IPyImage(filename=comp.image_path))
         except Exception as e:

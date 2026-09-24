@@ -269,6 +269,21 @@ def _step_ultralytics() -> None:
     else:
         _tqdm.write("  [already present] ultralytics")
 
+def _step_pyrender() -> None:
+    # GPU-accelerated offscreen mesh/point-cloud rendering for the 3D
+    # Showcase cell, via EGL — not Vulkan (Open3D's rendering.OffscreenRenderer
+    # needs Vulkan, which errored out on a real Kaggle GPU session with
+    # "Failed to load vulkan library!"). EGL is the standard headless-GPU-
+    # rendering path used across ML/robotics tooling on cloud GPU boxes
+    # (SMPL/Habitat/MuJoCo-adjacent code all use this exact pattern) and
+    # needs no display server or Vulkan loader, just the NVIDIA driver's
+    # existing EGL library. Best-effort: stage_views.py falls back to a
+    # flat-shaded matplotlib render if this isn't importable/working.
+    if not _try_import("pyrender"):
+        _pip_install("pyrender pyopengl", label="pyrender (GPU offscreen render via EGL)")
+    else:
+        _tqdm.write("  [already present] pyrender")
+
 def _step_mapanything() -> None:
     # MapAnything (Backbone C, the default) — a PLAIN pip install, no
     # --no-deps and no hand-picked extra-deps list: PHASE0_NOTES.md
@@ -302,6 +317,7 @@ _install_steps = [
     ("torchcodec (GPU decode)", _step_torchcodec),
     ("PyNvVideoCodec (GPU decode)", _step_pynvvideocodec),
     ("ultralytics (masking)", _step_ultralytics),
+    ("pyrender (3D showcase render)", _step_pyrender),
     ("mapanything (backbone)", _step_mapanything),
     ("verify mapanything + download weights", _step_verify_mapanything),
 ]
