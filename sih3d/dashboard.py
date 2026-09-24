@@ -259,6 +259,7 @@ class Dashboard:
         self.gpu_count = gpu_count
         self.gpu_util_history: list[deque] = [deque(maxlen=120) for _ in range(max(gpu_count, 1))]
         self.gpu_mem_history: list[deque] = [deque(maxlen=120) for _ in range(max(gpu_count, 1))]
+        self.gpu_decoder_util_history: list[deque] = [deque(maxlen=120) for _ in range(max(gpu_count, 1))]
         self.gpu_out = W.Output()
         self.gpu_box = W.VBox([W.HTML("<b>GPU</b>"), self.gpu_out], layout=W.Layout(border="1px solid #30363d", padding="6px", width="48%"))
 
@@ -418,6 +419,7 @@ class Dashboard:
             if idx < len(self.gpu_util_history):
                 self.gpu_util_history[idx].append(p["util_pct"])
                 self.gpu_mem_history[idx].append(p["mem_used_mb"])
+                self.gpu_decoder_util_history[idx].append(p.get("decoder_util_pct", 0.0))
 
         elif evt.type == EventType.FRAME_DECODED:
             self.frames_processed += 1
@@ -545,10 +547,23 @@ class Dashboard:
             axes = np.atleast_1d(axes)
             for i, ax in enumerate(axes):
                 hist = list(self.gpu_util_history[i]) if i < len(self.gpu_util_history) else []
-                ax.plot(hist, color="#1f6feb")
+                dec_hist = list(self.gpu_decoder_util_history[i]) if i < len(self.gpu_decoder_util_history) else []
+                ax.plot(hist, color="#1f6feb", label="SM")
+                if any(dec_hist):
+                    # NVDEC (decode engine) load is a separate counter from
+                    # SM/compute utilization — during frame extraction, SM%
+                    # can sit near-idle while decode is genuinely busy, so
+                    # without this line the panel looks like "GPU idle" even
+                    # when GPU decode is working correctly.
+                    ax.plot(dec_hist, color="#f0883e", label="Dec")
+                title = f"GPU{i} {hist[-1]:.0f}%" if hist else f"GPU{i}"
+                if dec_hist and dec_hist[-1]:
+                    title += f" (dec {dec_hist[-1]:.0f}%)"
                 ax.set_ylim(0, 100)
-                ax.set_title(f"GPU{i} {hist[-1]:.0f}%" if hist else f"GPU{i}", fontsize=8)
+                ax.set_title(title, fontsize=8)
                 ax.set_xticks([])
+                if any(dec_hist):
+                    ax.legend(fontsize=5, loc="upper right")
             plt.tight_layout()
             plt.show()
             plt.close(fig)
@@ -561,17 +576,33 @@ class Dashboard:
         with self.trajectory_out:
             self.trajectory_out.clear_output(wait=True)
             fig, ax = plt.subplots(figsize=(4, 3))
-            if self.gps_track:
-                xs, ys = zip(*self.gps_track)
-                ax.plot(xs, ys, "-", color="#8b949e", label="GPS", linewidth=1)
-            if self.processed_track:
-                xs, ys = zip(*self.processed_track)
-                ax.scatter(xs, ys, s=10, color="#1f6feb", label="processed keyframes")
-            if self.camera_track:
-                xs, ys = zip(*self.camera_track)
-                ax.plot(xs, ys, "-", color="#238636", label="estimated camera", linewidth=1)
-            ax.set_aspect("equal")
-            if self.gps_track or self.processed_track or self.camera_track:
+            has_data = bool(self.gps_track or self.processed_track or self.camera_track)
+            if not has_data:
+                # An empty axes here (the normal state for the whole
+                # frame_extraction stage, before camera_trajectory has run)
+                # reads as "broken", not "not started yet" — say which,
+                # and say why specifically when it's a no-GPS run rather
+                # than just "still waiting".
+                no_gps = self._header_info.get("telemetry_type") in (None, "none")
+                msg = (
+                    "No GPS — trajectory appears after pose estimation\n(approximate, ungeoreferenced)"
+                    if no_gps else
+                    "Waiting for trajectory data\n(appears once camera_trajectory stage runs)"
+                )
+                ax.text(0.5, 0.5, msg, ha="center", va="center", fontsize=8, color="#8b949e", transform=ax.transAxes, wrap=True)
+                ax.set_xticks([])
+                ax.set_yticks([])
+            else:
+                if self.gps_track:
+                    xs, ys = zip(*self.gps_track)
+                    ax.plot(xs, ys, "-", color="#8b949e", label="GPS", linewidth=1)
+                if self.processed_track:
+                    xs, ys = zip(*self.processed_track)
+                    ax.scatter(xs, ys, s=10, color="#1f6feb", label="processed keyframes")
+                if self.camera_track:
+                    xs, ys = zip(*self.camera_track)
+                    ax.plot(xs, ys, "-", color="#238636", label="estimated camera", linewidth=1)
+                ax.set_aspect("equal")
                 ax.legend(fontsize=6)
             plt.tight_layout()
             plt.show()

@@ -6,19 +6,26 @@ lazy/on-demand: callers ask for specific frame indices or a time range
 (the keyframe selector decides which frames actually get pulled), so we
 never decode the whole video into memory up front.
 
-A first Kaggle run (2x T4, 4K source, no telemetry) stalled in frame
-extraction for 20+ minutes: CPU pegged at 100%, GPU idle, with the log
-claiming "torchcodec on cuda:0". Root cause: `_select_backend()` only
-checked that `import torchcodec` succeeded, not that it actually decodes on
-the GPU — the PyPI `torchcodec` wheel can be a CPU-only build even when
-`torch.cuda.is_available()` is True, and it imports fine either way. Then,
-with no fps-based sampling, every raw frame in the QUICK window got decoded
-at native 4K one at a time. Fixed by: (1) actually decoding a handful of
-frames and checking both the returned tensor's device and achieved fps
-before trusting a backend, (2) sampling candidates at a target fps instead
-of every raw frame, (3) scaling early (GPU-side via scale_cuda when
-hwaccel'd) to a working resolution, and (4) periodic progress logging so a
-real stall is visible instead of a silent multi-minute gap in the log.
+Three real Kaggle runs (2x T4, 4K source) narrowed this down progressively:
+(1) torchcodec claimed cuda:0 but the PyPI wheel silently decoded on CPU —
+fixed by actually decoding a probe and checking the tensor's device+fps,
+not just that the import succeeded. (2) `ffmpeg -hwaccels` listing "cuda"
+only means ffmpeg was compiled with CUDA support, not that NVDEC engages at
+runtime — same fix, verify by decoding a real probe. (3) Even once ffmpeg
+decode itself was confirmed, the working-resolution downscale used
+`scale_cuda`/npp in the filter graph, which isn't reliably available in
+every ffmpeg build (and wasn't the thing actually decoding — see below);
+removed that dependency entirely in favor of PyNvVideoCodec (NVIDIA's
+direct NVDEC binding, decodes straight to a GPU tensor, no ffmpeg
+subprocess/pipe boundary at all) as the primary GPU path, with the
+downscale done via torch on the GPU right after decode, and ffmpeg
+`-hwaccel cuda` demoted to decode-only fallback (plain software `scale=`
+after hwaccel's automatic frame download, no cuda-specific filters).
+PyNvVideoCodec's exact API has shifted across versions and isn't
+verifiable against real NVIDIA hardware in this dev environment — it's
+implemented best-effort and, like every other backend here, gated behind
+an actual decode-and-measure check before being trusted, so a wrong guess
+just falls through to the next backend rather than crashing.
 """
 
 from __future__ import annotations
@@ -59,20 +66,83 @@ class FrameDecoder:
         if torchcodec_info is not None:
             return torchcodec_info
 
-        try:
-            import torch
-            if not torch.cuda.is_available():
-                raise RuntimeError("no CUDA device")
-            import PyNvVideoCodec  # noqa: F401
+        if self._verify_pynvvideocodec_gpu():
             return DecoderInfo(backend="pynvvideocodec", device=self.device)
-        except Exception as e:
-            self.bus.log(f"PyNvVideoCodec unavailable ({e}); trying ffmpeg -hwaccel cuda", level="warn")
 
         if self._ffmpeg_has_cuda_hwaccel() and self._verify_ffmpeg_cuda():
             return DecoderInfo(backend="ffmpeg_cuda", device=self.device)
 
         self.bus.log("No GPU decode path available; falling back to CPU decode", level="warn")
         return DecoderInfo(backend="cpu", device="cpu")
+
+    def _pynvvideocodec_frame_to_hwc(self, frame, device: str):
+        """Best-effort conversion of whatever PyNvVideoCodec hands back
+        into an HWC uint8 torch tensor on `device`. Tries the access
+        patterns documented across recent PyNvVideoCodec versions in
+        order; the first one that doesn't raise wins. Unverified against
+        real hardware — if none of these match the installed version,
+        this raises and the caller (verification or iteration, both
+        already wrapped) treats it as "this backend doesn't work here"."""
+        import torch
+
+        t = None
+        if hasattr(frame, "cuda"):
+            t = frame.cuda()  # some versions expose a torch-tensor-like accessor
+        elif hasattr(frame, "torch"):
+            t = frame.torch()
+        elif hasattr(frame, "__cuda_array_interface__") or hasattr(frame, "__array_interface__"):
+            t = torch.as_tensor(frame, device=device)
+        else:
+            t = torch.as_tensor(frame, device=device)
+        t = t.to(device)
+        if t.ndim == 3 and t.shape[0] in (3, 4):  # CHW -> HWC
+            t = t[:3].permute(1, 2, 0)
+        elif t.ndim == 3 and t.shape[-1] in (3, 4):
+            t = t[..., :3]
+        else:
+            raise RuntimeError(f"unexpected PyNvVideoCodec frame shape {tuple(t.shape)}")
+        return t
+
+    def _verify_pynvvideocodec_gpu(self, n_probe: int = 30, min_fps_4k: float = 100.0, min_fps_other: float = 40.0) -> bool:
+        """NVIDIA's official NVDEC binding — decodes straight into GPU
+        memory with no ffmpeg subprocess/pipe boundary at all, so it
+        should comfortably clear a higher fps floor than the ffmpeg paths
+        (targeting >100fps at 4K on a T4's dedicated NVDEC engine, well
+        past what a 4-vCPU Kaggle instance can do in software). See the
+        module docstring for why this is best-effort/unverified."""
+        try:
+            import PyNvVideoCodec as nvc
+
+            w, h, _ = self._probe_dims()
+            min_fps = min_fps_4k if max(w, h) >= 3000 else min_fps_other
+            dev_id = int(self.device.split(":")[-1]) if ":" in self.device else 0
+
+            dec = nvc.SimpleDecoder(
+                str(self.video_path), cuda_device_id=dev_id,
+                use_device_memory=True, output_color_type=nvc.OutputColorType.RGB,
+            )
+            n = min(n_probe, len(dec))
+            if n == 0:
+                return False
+
+            t0 = time.time()
+            for i in range(n):
+                self._pynvvideocodec_frame_to_hwc(dec[i], self.device)
+            elapsed = time.time() - t0
+            fps = n / elapsed if elapsed > 0 else 0.0
+
+            if fps < min_fps:
+                self.bus.log(
+                    f"PyNvVideoCodec measured only {fps:.1f} fps over {n} frames at {w}x{h} "
+                    f"(below the {min_fps:.0f} fps floor) — trying ffmpeg -hwaccel cuda", level="warn",
+                )
+                return False
+
+            self.bus.log(f"PyNvVideoCodec verified: {fps:.1f} fps over {n} real frames at {w}x{h}, on {self.device}")
+            return True
+        except Exception as e:
+            self.bus.log(f"PyNvVideoCodec unavailable/failed ({type(e).__name__}: {e}) — trying ffmpeg -hwaccel cuda", level="warn")
+            return False
 
     def _verify_ffmpeg_cuda(self, n_probe: int = 30, min_fps_4k: float = 60.0, min_fps_other: float = 24.0) -> bool:
         """`ffmpeg -hwaccels` listing "cuda" only means ffmpeg was compiled
@@ -180,10 +250,10 @@ class FrameDecoder:
         instead of every raw frame — this is what actually bounds decode
         work on a long/high-fps source; `stride` is a plain frame-count
         step, used only when `target_fps` is not given. `scale_width`, when
-        set and smaller than the source width, scales frames down early
-        (GPU-side via scale_cuda on the hwaccel path) to a working
-        resolution before they ever hit CPU/pipe I/O or downstream
-        sharpness scoring."""
+        set and smaller than the source width, scales frames down early to
+        a working resolution before downstream sharpness scoring — on the
+        GPU via torch, right after decode, on the PyNvVideoCodec path; via
+        a plain software ffmpeg filter otherwise."""
         gen = self._iter_backend(start_s, end_s, stride, target_fps, scale_width)
         yield from self._with_progress_logging(gen, start_s, end_s, target_fps)
 
@@ -233,13 +303,48 @@ class FrameDecoder:
             yield i, i / fps, arr
 
     def _iter_pynvvideocodec(self, start_s, end_s, stride, target_fps, scale_width):
-        # PyNvVideoCodec's API varies by version; fall back to ffmpeg CUDA
-        # if the demuxer/decoder objects aren't importable/usable at runtime.
+        """Decodes straight to a GPU tensor and downscales there too (via
+        torch, right after decode) — the whole point of this backend over
+        the ffmpeg paths is that nothing ever needs to cross back to CPU
+        memory until after the (small, already-scaled) frame is ready.
+        Only reached after `_verify_pynvvideocodec_gpu` already exercised
+        this same conversion path successfully, but still wrapped: a
+        failure partway through (e.g. on a frame this specific video
+        triggers differently) falls through to ffmpeg -hwaccel cuda rather
+        than losing the whole run."""
         try:
-            yield from self._iter_ffmpeg(start_s, end_s, stride, hwaccel=True, target_fps=target_fps, scale_width=scale_width)
+            import PyNvVideoCodec as nvc
+            import torch
+            import torch.nn.functional as F
+
+            dev_id = int(self.device.split(":")[-1]) if ":" in self.device else 0
+            dec = nvc.SimpleDecoder(
+                str(self.video_path), cuda_device_id=dev_id,
+                use_device_memory=True, output_color_type=nvc.OutputColorType.RGB,
+            )
+            n = len(dec)
+            w, h, native_fps = self._probe_dims()
+            start_idx = int(start_s * native_fps)
+            end_idx = int(end_s * native_fps) if end_s is not None else n
+            step = max(1, round(native_fps / target_fps)) if target_fps else stride
+
+            out_wh = None
+            if scale_width and scale_width < w:
+                out_w = max(2, int(scale_width) // 2 * 2)
+                out_h = max(2, int(round(h * (out_w / w))) // 2 * 2)
+                out_wh = (out_w, out_h)
+
+            for i in range(start_idx, min(end_idx, n), step):
+                t = self._pynvvideocodec_frame_to_hwc(dec[i], self.device)
+                if out_wh is not None:
+                    t = t.permute(2, 0, 1).unsqueeze(0).float()
+                    t = F.interpolate(t, size=(out_wh[1], out_wh[0]), mode="bilinear", align_corners=False)
+                    t = t.squeeze(0).clamp(0, 255).byte().permute(1, 2, 0)
+                arr = t.contiguous().to("cpu").numpy()
+                yield i, i / native_fps, arr
         except Exception as e:
-            self.bus.log(f"PyNvVideoCodec path failed at runtime ({e}); falling back to CPU decode", level="warn")
-            yield from self._iter_ffmpeg(start_s, end_s, stride, hwaccel=False, target_fps=target_fps, scale_width=scale_width)
+            self.bus.log(f"PyNvVideoCodec decode failed at runtime ({type(e).__name__}: {e}); falling back to ffmpeg -hwaccel cuda", level="warn")
+            yield from self._iter_ffmpeg(start_s, end_s, stride, hwaccel=True, target_fps=target_fps, scale_width=scale_width)
 
     def _iter_ffmpeg(self, start_s, end_s, stride, hwaccel: bool, target_fps=None, scale_width=None, allow_fallback: bool = True):
         import subprocess
@@ -247,12 +352,18 @@ class FrameDecoder:
         w, h, native_fps = self._probe_dims()
         cmd = ["ffmpeg", "-v", "error"]
         if hwaccel:
-            # Deliberately NOT `-hwaccel_output_format cuda`: NVDEC still
-            # does the actual decode on the GPU, but frames land back in
-            # system memory afterward, which lets the (software) `fps`
-            # filter run first and cheaply drop most frames BEFORE any of
-            # them get uploaded again for scale_cuda below — cheaper than
-            # decoding every raw frame at full hw-frame resolution.
+            # `-hwaccel cuda` alone (no `-hwaccel_output_format cuda`): this
+            # is decode-only GPU acceleration — NVDEC does the actual
+            # decode, and ffmpeg auto-downloads each frame to system memory
+            # right after. Deliberately NOT using scale_cuda/npp for the
+            # downscale below: that filter isn't reliably available in
+            # every ffmpeg build (confirmed a real issue — the "GPU decode
+            # is on but everything's still slow" case turned out to be this
+            # filter silently failing, not NVDEC itself), and PyNvVideoCodec
+            # is now the primary path for a true no-CPU-roundtrip GPU
+            # decode+scale anyway. This path is decode-acceleration only;
+            # scaling happens the same (software, CPU) way as the plain-CPU
+            # path below.
             cmd += ["-hwaccel", "cuda"]
         # `-ss` before `-i`: a single fast seek to the QUICK window's start,
         # never a per-frame seek — everything after this is one sequential
@@ -272,10 +383,7 @@ class FrameDecoder:
         elif stride > 1:
             filters.append(f"select='not(mod(n\\,{stride}))'")
         if (out_w, out_h) != (w, h):
-            if hwaccel:
-                filters += ["hwupload_cuda", f"scale_cuda={out_w}:{out_h}", "hwdownload", "format=nv12"]
-            else:
-                filters.append(f"scale={out_w}:{out_h}")
+            filters.append(f"scale={out_w}:{out_h}")
         if filters:
             cmd += ["-vf", ",".join(filters)]
         cmd += ["-pix_fmt", "rgb24", "-f", "rawvideo", "-"]

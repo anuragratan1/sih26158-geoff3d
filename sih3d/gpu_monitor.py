@@ -31,6 +31,7 @@ class GpuSample:
     util_pct: float
     mem_used_mb: float
     mem_total_mb: float
+    decoder_util_pct: float = 0.0
 
 
 @dataclass
@@ -42,9 +43,16 @@ class GpuHistory:
         if len(self.samples) > cap:
             del self.samples[: len(self.samples) - cap]
 
-    def average_util(self, index: int, t0: float, t1: float) -> float | None:
-        vals = [s.util_pct for s in self.samples if s.index == index and t0 <= s.ts <= t1]
+    def average_util(self, index: int, t0: float, t1: float, metric: str = "util_pct") -> float | None:
+        vals = [getattr(s, metric) for s in self.samples if s.index == index and t0 <= s.ts <= t1]
         return sum(vals) / len(vals) if vals else None
+
+    def idle_fraction(self, index: int, t0: float, t1: float, idle_below_pct: float = 5.0) -> float | None:
+        """Fraction of samples in [t0, t1] where SM utilization sat below
+        `idle_below_pct` — used to flag "GPU sat idle" stretches during a
+        stage rather than just reporting a possibly-misleading average."""
+        vals = [s.util_pct for s in self.samples if s.index == index and t0 <= s.ts <= t1]
+        return (sum(1 for v in vals if v < idle_below_pct) / len(vals)) if vals else None
 
 
 class GpuMonitor:
@@ -111,6 +119,19 @@ class GpuMonitor:
                 try:
                     util = pynvml.nvmlDeviceGetUtilizationRates(h)
                     mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                    # Separate try/except: NVDEC load does NOT show up in
+                    # `util.gpu` (that's SM/compute utilization only) — a
+                    # real Kaggle run showed a near-empty GPU graph during
+                    # frame extraction even once GPU decode was genuinely
+                    # engaged, because this dashboard was blind to the
+                    # decode engine's own utilization counter. Some driver/
+                    # GPU combinations don't expose this call, so it's
+                    # allowed to fail independently of the main sample.
+                    try:
+                        dec = pynvml.nvmlDeviceGetDecoderUtilization(h)
+                        decoder_pct = float(dec[0]) if isinstance(dec, (tuple, list)) else float(getattr(dec, "utilization", 0))
+                    except Exception:
+                        decoder_pct = 0.0
                     sample = GpuSample(
                         ts=t0,
                         index=i,
@@ -118,6 +139,7 @@ class GpuMonitor:
                         util_pct=float(util.gpu),
                         mem_used_mb=mem.used / (1024 * 1024),
                         mem_total_mb=mem.total / (1024 * 1024),
+                        decoder_util_pct=decoder_pct,
                     )
                 except Exception:
                     sample = GpuSample(ts=t0, index=i, name=self._names[i], util_pct=0.0, mem_used_mb=0.0, mem_total_mb=0.0)
@@ -129,6 +151,7 @@ class GpuMonitor:
                     util_pct=sample.util_pct,
                     mem_used_mb=sample.mem_used_mb,
                     mem_total_mb=sample.mem_total_mb,
+                    decoder_util_pct=sample.decoder_util_pct,
                     ts=sample.ts,
                 )
             elapsed = time.time() - t0
