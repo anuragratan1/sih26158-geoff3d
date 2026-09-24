@@ -71,39 +71,201 @@ def build_vertex_colored_mesh(
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(cloud.points)
-    pcd.colors = o3d.utility.Vector3dVector(np.clip(cloud.colors, 0, 255) / 255.0)
+    colors01 = np.clip(cloud.colors, 0, 255) / 255.0
+    pcd.colors = o3d.utility.Vector3dVector(colors01)
     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
     pcd.orient_normals_consistent_tangent_plane(30)
+    normals = np.asarray(pcd.normals)
+
+    # Open3D's native Poisson/ball-pivoting solvers can hard-abort the whole
+    # process on degenerate/pathological point distributions (observed
+    # directly: a synthetic test point cloud crashed the interpreter with
+    # "libc++abi: terminating" from deep inside PoissonRecon's C++ — no
+    # Python try/except can catch a native abort). Both are run in an
+    # isolated subprocess so a crash there kills only that subprocess; the
+    # pipeline sees it as an ordinary failure and falls back normally.
+    method = "poisson"
+    poisson_out = _run_isolated_meshing(_poisson_worker, (cloud.points, colors01, normals, poisson_depth), bus, "Poisson")
+    if poisson_out is not None:
+        vertices, triangles, vcolors = poisson_out
+    else:
+        bus.log("Poisson reconstruction failed/crashed; trying ball-pivoting as a second fallback", level="warn")
+        distances = pcd.compute_nearest_neighbor_distance()
+        avg_dist = float(np.mean(distances)) if len(distances) else 0.05
+        radii = [avg_dist * r for r in (1.5, 2.0, 3.0)]
+        bp_out = _run_isolated_meshing(_ball_pivot_worker, (cloud.points, colors01, normals, radii), bus, "ball-pivoting")
+        if bp_out is not None:
+            vertices, triangles, vcolors = bp_out
+            method = "ball_pivoting"
+        else:
+            bus.log(
+                "Ball-pivoting also failed/crashed; trying 2.5D Delaunay triangulation as a third fallback "
+                "(a ground-projected heightfield mesh — often the more robust choice for open, nadir-view "
+                "aerial point clouds anyway, since Poisson/ball-pivoting assume more closed/volumetric input)",
+                level="warn",
+            )
+            dt_out = _run_isolated_meshing(_delaunay_2p5d_worker, (cloud.points, colors01), bus, "Delaunay 2.5D", timeout_s=30.0)
+            if dt_out is None:
+                bus.log("2.5D Delaunay also failed — mesh generation skipped", level="warn")
+                return MeshResult(mesh=None, method="none")
+            vertices, triangles, vcolors = dt_out
+            method = "delaunay_2p5d"
+
+    if len(vertices) == 0:
+        bus.log("Meshing produced zero vertices — mesh generation skipped", level="warn")
+        return MeshResult(mesh=None, method="none")
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    if vcolors is not None:
+        mesh.vertex_colors = o3d.utility.Vector3dVector(vcolors)
+    mesh.compute_vertex_normals()
+    bus.log(f"Mesh: built via {method} from point cloud ({len(mesh.vertices)} vertices, {len(mesh.triangles)} faces)")
+    return MeshResult(mesh=mesh, method=method, n_vertices=len(mesh.vertices), n_faces=len(mesh.triangles))
+
+
+def _poisson_worker(points, colors, normals, depth, result_queue) -> None:
+    import numpy as _np
+    import open3d as _o3d
 
     try:
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=poisson_depth)
-        densities = np.asarray(densities)
+        pcd = _o3d.geometry.PointCloud()
+        pcd.points = _o3d.utility.Vector3dVector(points)
+        pcd.colors = _o3d.utility.Vector3dVector(colors)
+        pcd.normals = _o3d.utility.Vector3dVector(normals)
+        mesh, densities = _o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+        densities = _np.asarray(densities)
         # Trim low-density (extrapolated/hallucinated) vertices at the
         # reconstruction's outer fringe — Poisson fills holes by design,
         # which without trimming produces a bloated blob past the actual
         # observed surface.
-        keep = densities >= np.quantile(densities, 0.02)
+        keep = densities >= _np.quantile(densities, 0.02)
         mesh.remove_vertices_by_mask(~keep)
         mesh.remove_degenerate_triangles()
         mesh.remove_unreferenced_vertices()
+        result_queue.put((
+            _np.asarray(mesh.vertices), _np.asarray(mesh.triangles),
+            _np.asarray(mesh.vertex_colors) if mesh.has_vertex_colors() else None,
+        ))
     except Exception as e:
-        bus.log(f"Poisson reconstruction failed ({e}); trying ball-pivoting as a second fallback", level="warn")
+        result_queue.put(RuntimeError(f"{type(e).__name__}: {e}"))
+
+
+def _ball_pivot_worker(points, colors, normals, radii, result_queue) -> None:
+    import numpy as _np
+    import open3d as _o3d
+
+    try:
+        pcd = _o3d.geometry.PointCloud()
+        pcd.points = _o3d.utility.Vector3dVector(points)
+        pcd.colors = _o3d.utility.Vector3dVector(colors)
+        pcd.normals = _o3d.utility.Vector3dVector(normals)
+        mesh = _o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(pcd, _o3d.utility.DoubleVector(radii))
+        result_queue.put((
+            _np.asarray(mesh.vertices), _np.asarray(mesh.triangles),
+            _np.asarray(mesh.vertex_colors) if mesh.has_vertex_colors() else None,
+        ))
+    except Exception as e:
+        result_queue.put(RuntimeError(f"{type(e).__name__}: {e}"))
+
+
+def _delaunay_2p5d_worker(points, colors, result_queue) -> None:
+    """Ground-projected 2.5D triangulation: Delaunay on the XY projection,
+    Z carried through as height. A much more mature, robust algorithm than
+    Poisson/ball-pivoting for this specific shape of input (scipy's Qhull
+    binding essentially never crashes or hangs on a well-formed 2D point
+    set), and arguably the more *appropriate* one for open, single-pass
+    nadir aerial capture in the first place — it's the same footprint
+    concept as the DSM raster (export.py's export_dsm_orthomosaic), just
+    kept as an actual triangle mesh instead of a rasterized grid."""
+    import numpy as _np
+    from scipy.spatial import Delaunay as _Delaunay
+
+    try:
+        xy = points[:, :2]
+        tri = _Delaunay(xy)
+        simplices = tri.simplices
+
+        p0, p1, p2 = points[simplices[:, 0]], points[simplices[:, 1]], points[simplices[:, 2]]
+        edge_lens = _np.stack([
+            _np.linalg.norm(p0[:, :2] - p1[:, :2], axis=1),
+            _np.linalg.norm(p1[:, :2] - p2[:, :2], axis=1),
+            _np.linalg.norm(p2[:, :2] - p0[:, :2], axis=1),
+        ], axis=1)
+        max_edge = edge_lens.max(axis=1)
+        # Delaunay triangulates the full convex hull, including spurious
+        # triangles that bridge across real gaps in an open point cloud
+        # (unobserved areas). Drop the longest outlier edges.
+        thresh = max(float(_np.percentile(max_edge, 95)) * 2.0, 1e-6)
+        simplices = simplices[max_edge < thresh]
+
+        result_queue.put((points, simplices, colors))
+    except Exception as e:
+        result_queue.put(RuntimeError(f"{type(e).__name__}: {e}"))
+
+
+def _run_isolated_meshing(worker_fn, args: tuple, bus: EventBus, label: str, timeout_s: float = 45.0):
+    """Runs `worker_fn(*args, result_queue)` in a subprocess. Returns
+    (vertices, triangles, colors) on success, None on any failure —
+    including a native crash (nonzero/None exit code) or a timeout, both
+    logged the same way as an ordinary caught exception.
+
+    Drains the queue BEFORE calling proc.join() — calling join() first is a
+    classic multiprocessing deadlock (documented in Python's own docs, and
+    hit directly here): a mesh result is a few MB, comfortably over the OS
+    pipe buffer, so Queue.put() in the child blocks on its background
+    feeder thread until the parent reads, and the child can't fully exit
+    (so join() never returns) until put() finishes. Poisson's occasional
+    fast "crashed" report earlier masked this — it usually aborted before
+    ever reaching put() — but ball-pivoting and even a plain scipy Delaunay
+    call (independently confirmed to run in ~0.2s standalone) both hung
+    until forcibly killed, because their results *did* reach put().
+    """
+    import multiprocessing as mp
+
+    # "fork" copies the already-fully-loaded parent process (torch/open3d/
+    # scipy already imported) via copy-on-write, essentially instant.
+    # "spawn" re-imports everything from scratch in the child — observed
+    # locally to cost 15-20s+ per attempt just on startup. Kaggle (Linux)
+    # supports fork; only platforms without it (Windows) fall back to spawn.
+    ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context("spawn")
+    result_queue: "mp.Queue" = ctx.Queue()
+    proc = ctx.Process(target=worker_fn, args=(*args, result_queue))
+    proc.start()
+
+    deadline = time.time() + timeout_s
+    result = _SENTINEL_NO_RESULT = object()
+    while time.time() < deadline:
         try:
-            distances = pcd.compute_nearest_neighbor_distance()
-            avg_dist = float(np.mean(distances))
-            radii = [avg_dist * r for r in (1.5, 2.0, 3.0)]
-            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(pcd, o3d.utility.DoubleVector(radii))
-        except Exception as e2:
-            bus.log(f"Ball-pivoting also failed ({e2}) — mesh generation skipped", level="warn")
-            return MeshResult(mesh=None, method="none")
+            result = result_queue.get(timeout=0.1)
+            break
+        except Exception:
+            pass
+        if not proc.is_alive():
+            break
 
-    if len(mesh.vertices) == 0:
-        bus.log("Meshing produced zero vertices — mesh generation skipped", level="warn")
-        return MeshResult(mesh=None, method="none")
+    if result is _SENTINEL_NO_RESULT:
+        try:
+            result = result_queue.get_nowait()
+        except Exception:
+            result = _SENTINEL_NO_RESULT
 
-    mesh.compute_vertex_normals()
-    bus.log(f"Mesh: built via Poisson/ball-pivoting from point cloud ({len(mesh.vertices)} vertices, {len(mesh.triangles)} faces)")
-    return MeshResult(mesh=mesh, method="poisson", n_vertices=len(mesh.vertices), n_faces=len(mesh.triangles))
+    if proc.is_alive():
+        proc.terminate()
+    proc.join(5)
+
+    if result is not _SENTINEL_NO_RESULT:
+        if isinstance(result, Exception):
+            bus.log(f"{label} failed: {result}", level="warn")
+            return None
+        return result
+
+    if proc.exitcode not in (0, None) and proc.exitcode != -15:  # -15 = our own terminate()
+        bus.log(f"{label} subprocess crashed (exit code {proc.exitcode}, likely a native library abort) — isolated, pipeline continues", level="warn")
+    else:
+        bus.log(f"{label} timed out after {timeout_s:.0f}s — treating as failed", level="warn")
+    return None
 
 
 @dataclass

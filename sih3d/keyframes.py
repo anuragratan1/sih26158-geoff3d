@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .events import EventBus, EventType
+from .events import EventBus
 
 _LAPLACIAN_KERNEL = [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]
 
@@ -123,14 +123,12 @@ def select_keyframes(
         if sharpness[i] < floor:
             cand.reject_reason = f"sharpness {sharpness[i]:.1f} below floor {floor:.1f}"
             selection.rejected.append(cand)
-            bus.publish(EventType.KEYFRAME_REJECTED, frame_index=cand.frame_index, reason=cand.reject_reason)
             continue
 
         if gps is not None:
             if last_kept_gps is not None and _haversine_like_enu_distance(gps, last_kept_gps) < min_gps_spacing_m:
                 cand.reject_reason = f"GPS spacing < {min_gps_spacing_m}m from last keyframe"
                 selection.rejected.append(cand)
-                bus.publish(EventType.KEYFRAME_REJECTED, frame_index=cand.frame_index, reason=cand.reject_reason)
                 continue
             last_kept_gps = gps
         else:
@@ -138,12 +136,10 @@ def select_keyframes(
             if kept_since_gps_none % max_no_gps_frame_stride != 1 and n > max_no_gps_frame_stride:
                 cand.reject_reason = "frame-stride spacing (no GPS available)"
                 selection.rejected.append(cand)
-                bus.publish(EventType.KEYFRAME_REJECTED, frame_index=cand.frame_index, reason=cand.reject_reason)
                 continue
 
         cand.accepted = True
         selection.accepted.append(cand)
-        bus.publish(EventType.KEYFRAME_ACCEPTED, frame_index=cand.frame_index, sharpness=cand.sharpness)
 
     bus.log(
         f"Keyframe selection: {len(selection.accepted)} accepted, {len(selection.rejected)} rejected "
