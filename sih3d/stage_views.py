@@ -363,12 +363,12 @@ def render_final_summary(report: ReportBuilder) -> None:
     plt = _require_matplotlib()
     d = report.to_dict()
 
-    rows = "".join(
-        f"<tr><td>{s['name']}</td><td>{s['status']}</td>"
-        f"<td>{s['elapsed_s']:.1f}s</td>" if s["elapsed_s"] is not None else "<td>-</td>"
-        f"<td>{', '.join(f'GPU{k}: {v:.0f}%' for k, v in s['avg_gpu_util_pct'].items()) or '-'}</td></tr>"
-        for s in d["stages"]
-    )
+    def _row(s: dict) -> str:
+        elapsed = f"{s['elapsed_s']:.1f}s" if s["elapsed_s"] is not None else "-"
+        gpu = ", ".join(f"GPU{k}: {v:.0f}%" for k, v in s["avg_gpu_util_pct"].items()) or "-"
+        return f"<tr><td>{s['name']}</td><td>{s['status']}</td><td>{elapsed}</td><td>{gpu}</td></tr>"
+
+    rows = "".join(_row(s) for s in d["stages"])
     from IPython.display import HTML, display
 
     display(HTML(f"<table><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Avg GPU Util</th></tr>{rows}</table>"))
@@ -380,3 +380,110 @@ def render_final_summary(report: ReportBuilder) -> None:
         print(f"\n{len(d['fallbacks_triggered'])} fallback(s) triggered:")
         for f in d["fallbacks_triggered"]:
             print(" -", f)
+
+
+def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: int = 48, video_fps: int = 24) -> None:
+    """Best-effort: a few stills + a short orbit video rendered straight
+    from the reconstructed mesh (falls back to the point cloud if no mesh
+    was produced), displayed inline so there's something to actually look
+    at without leaving the notebook or downloading anything. Needs a
+    working headless GL context (EGL/OSMesa) for Open3D's offscreen
+    renderer and ffmpeg on PATH for the video — both best-effort, this
+    never raises past this function, it just says what's missing.
+
+    Camera up-vector is explicitly [0, 0, 1]: every point/camera-track
+    coordinate in this pipeline is local-ENU (East-North-Up, Z is up — see
+    viewer.py/telemetry.py), not the [0, 1, 0] "Y-up" a lot of 3D tooling
+    defaults to. Getting that wrong is the single most common cause of a
+    render coming out sideways or upside-down.
+    """
+    import io
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from IPython.display import Image as IPyImage, Video, display
+    from PIL import Image as PILImage
+
+    mesh_path = artifacts.output_paths.get("mesh.glb") or artifacts.output_paths.get("mesh.obj")
+    cloud_path = artifacts.output_paths.get("pointcloud.ply")
+    if not mesh_path and not cloud_path:
+        print("Nothing to render yet: no mesh or point cloud output found.")
+        return
+
+    try:
+        import open3d as o3d
+        import open3d.visualization.rendering as rendering
+    except Exception as e:
+        print(f"Showcase render unavailable: Open3D not usable ({e}).")
+        return
+
+    up = [0.0, 0.0, 1.0]  # ENU: Z is up
+
+    geometry, is_mesh = None, False
+    if mesh_path:
+        try:
+            m = o3d.io.read_triangle_mesh(mesh_path, enable_post_processing=True)
+            if len(m.vertices) > 0:
+                m.compute_vertex_normals()
+                geometry, is_mesh = m, True
+        except Exception as e:
+            print(f"Could not load {mesh_path} for showcase render ({e}); trying point cloud instead.")
+    if geometry is None and cloud_path:
+        try:
+            pc = o3d.io.read_point_cloud(cloud_path)
+            if len(pc.points) > 0:
+                geometry = pc
+        except Exception as e:
+            print(f"Could not load {cloud_path} for showcase render ({e}).")
+    if geometry is None:
+        print("Showcase render skipped: nothing loadable.")
+        return
+
+    try:
+        center = geometry.get_center()
+        extent = np.asarray(geometry.get_max_bound()) - np.asarray(geometry.get_min_bound())
+        radius = float(np.linalg.norm(extent)) or 10.0
+        elevation = radius * 0.6
+
+        renderer = rendering.OffscreenRenderer(640, 480)
+        mat = rendering.MaterialRecord()
+        mat.shader = "defaultLit" if is_mesh else "defaultUnlit"
+        if not is_mesh:
+            try:
+                mat.point_size = 3.0
+            except Exception:
+                pass
+        renderer.scene.add_geometry("geo", geometry, mat)
+        renderer.scene.set_background([0.05, 0.06, 0.08, 1.0])
+
+        def _snapshot(angle_deg: float):
+            rad = np.radians(angle_deg)
+            eye = center + np.array([radius * np.cos(rad), radius * np.sin(rad), elevation])
+            renderer.scene.camera.look_at(center, eye, up)
+            return np.asarray(renderer.render_to_image())
+
+        print(f"Rendering {n_photos} stills...")
+        for angle in np.linspace(0, 360, n_photos, endpoint=False):
+            buf = io.BytesIO()
+            PILImage.fromarray(_snapshot(float(angle))).save(buf, format="PNG")
+            display(IPyImage(data=buf.getvalue()))
+
+        print(f"Rendering a {video_frames}-frame orbit video...")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for i in range(video_frames):
+                PILImage.fromarray(_snapshot(360.0 * i / video_frames)).save(tmp_path / f"frame_{i:04d}.png")
+
+            video_path = tmp_path / "orbit.mp4"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-framerate", str(video_fps), "-i", str(tmp_path / "frame_%04d.png"),
+                 "-pix_fmt", "yuv420p", str(video_path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0 or not video_path.exists():
+                print(f"Orbit video assembly failed ({result.stderr.strip()[-300:]}); stills above are still available.")
+                return
+            display(Video(str(video_path), embed=True, html_attributes="controls loop"))
+    except Exception as e:
+        print(f"Showcase render failed ({type(e).__name__}: {e}); the downloadable mesh.glb/pointcloud.ply above are still valid.")
