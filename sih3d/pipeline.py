@@ -62,6 +62,7 @@ import numpy as np
 from . import align, export, masks
 from . import backbone as backbone_mod
 from . import mesh as mesh_mod
+from .artifacts import ChunkAlignmentRecord, ChunkGeometrySample, KeyframeRecord, RunArtifacts
 from .backbone import ChunkResult, PriorMode, ViewInput
 from .decode import FrameDecoder
 from .events import Event, EventBus, EventType
@@ -157,6 +158,20 @@ def _resize_for_backbone(img: np.ndarray, size: int) -> np.ndarray:
     return np.array(pil)
 
 
+def _make_thumbnail(img: np.ndarray, max_width: int = 120) -> np.ndarray:
+    """Small RGB copy for the notebook's keyframe grid — keeping full-res
+    frames around for every keyframe (not just accepted ones, since
+    rejected ones are shown greyed out too) would be a real memory cost at
+    FULL-mode scale."""
+    from PIL import Image
+
+    h, w = img.shape[:2]
+    if w <= max_width:
+        return img.copy()
+    new_h = max(1, int(h * max_width / w))
+    return np.array(Image.fromarray(img).resize((max_width, new_h), Image.BILINEAR))
+
+
 class Pipeline:
     def __init__(
         self, config: PipelineConfig, detected: DetectedInputs, telemetry: TelemetryTrack | None,
@@ -197,6 +212,8 @@ class Pipeline:
         self._export_statuses: list = []
         self.georeferenced: bool = self.detected.telemetry_path is not None or self.detected.telemetry_kind == "embedded"
         self.epsg: int | None = None
+        self.artifacts = RunArtifacts()
+        self._chunk_alignment_records: dict[int, ChunkAlignmentRecord] = {}
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -323,6 +340,8 @@ class Pipeline:
             if len(enu_pts) >= 3:
                 collinearity = compute_collinearity(enu_pts)
                 self._log(f"Flight-track collinearity index: {collinearity:.3f} (near 0 = straight single pass)")
+        self.artifacts.collinearity_index = collinearity
+        self.artifacts.georeferenced = self.georeferenced
 
         # -- Chunking --------------------------------------------------------
         chunks = self._make_chunks(keyframes)
@@ -380,10 +399,19 @@ class Pipeline:
         except Exception as e:
             self._fallback("mesh_textured_model", e)
 
+        self.artifacts.point_count = len(cloud.points)
+        if len(cloud.points) > 0:
+            preview_n = min(len(cloud.points), 50_000)
+            preview_idx = np.random.default_rng(0).choice(len(cloud.points), size=preview_n, replace=False)
+            self.artifacts.point_cloud_preview = cloud.points[preview_idx]
+            self.artifacts.point_cloud_preview_colors = cloud.colors[preview_idx]
+
         mesh_result = mesh_mod.MeshResult(mesh=None, method="none")
         bake_result = None
         try:
             mesh_result = mesh_mod.build_vertex_colored_mesh(cloud, tsdf=None, bus=self.bus)
+            if mesh_result.mesh is not None:
+                self._emit(EventType.MESH_PREVIEW, mesh=mesh_result, bake=None, stage="coarse")
         except Exception as e:
             self._fallback("mesh_textured_model", e)
 
@@ -394,10 +422,15 @@ class Pipeline:
                     for kf in keyframes if getattr(kf, "_resolved_world_pose", None) is not None
                 ]
                 bake_result = mesh_mod.bake_texture(mesh_result.mesh, kf_for_bake, self.bus, time_budget_s=cfg.texture_time_budget_s)
+                if bake_result is not None and bake_result.textured:
+                    self._emit(EventType.MESH_PREVIEW, mesh=mesh_result, bake=bake_result, stage="textured")
         except Exception as e:
             self._fallback("mesh_textured_model", e)
-        self._emit(EventType.MESH_PREVIEW, mesh=mesh_result)
         self._emit(EventType.STAGE_DONE, stage="mesh_textured_model")
+
+        self.artifacts.mesh_n_vertices = mesh_result.n_vertices
+        self.artifacts.mesh_n_faces = mesh_result.n_faces
+        self.artifacts.mesh_method = mesh_result.method
 
         self.report.set_geometry_summary(
             georeferenced=self.georeferenced, collinearity_index=collinearity, alignment_rmse_m=alignment_rmse,
@@ -454,7 +487,13 @@ class Pipeline:
             device=cfg.device0 if "cuda" in cfg.device0 else "cpu",
         )
         for c in selection.rejected:
-            self._emit(EventType.KEYFRAME_REJECTED, thumbnail=raw_frames[raw_indices.index(c.frame_index)] if c.frame_index in raw_indices else None)
+            img = raw_frames[raw_indices.index(c.frame_index)] if c.frame_index in raw_indices else None
+            self._emit(EventType.KEYFRAME_REJECTED, thumbnail=img)
+            self.artifacts.keyframes.append(KeyframeRecord(
+                frame_index=c.frame_index, timestamp_s=c.timestamp_s,
+                thumbnail=_make_thumbnail(img) if img is not None else None,
+                sharpness=c.sharpness, accepted=False, reject_reason=c.reject_reason,
+            ))
 
         accepted = selection.accepted
         if cfg.mode == "QUICK" and len(accepted) > cfg.quick_max_keyframes:
@@ -472,6 +511,12 @@ class Pipeline:
                 gps_enu=cand.gps_enu, intrinsics=intrinsics, camera_pose_c2w_prior=None,
             ))
             self._emit(EventType.KEYFRAME_ACCEPTED, thumbnail=img)
+            self.artifacts.keyframes.append(KeyframeRecord(
+                frame_index=cand.frame_index, timestamp_s=cand.timestamp_s,
+                thumbnail=_make_thumbnail(img), sharpness=cand.sharpness, accepted=True,
+            ))
+            if cand.gps_enu is not None:
+                self.artifacts.gps_track_enu.append(cand.gps_enu)
 
         return prepared
 
@@ -632,10 +677,15 @@ class Pipeline:
                     alignment = self.chunk_alignments[-1] if self.chunk_alignments else align.first_chunk_identity(False)
 
         self.chunk_alignments.append(alignment)
+        record = ChunkAlignmentRecord(chunk_idx=chunk_idx, mode=alignment.mode, rmse_before_m=alignment.rmse_m)
+        self._chunk_alignment_records[chunk_idx] = record
+        self.artifacts.chunk_alignments.append(record)
+
         world_cam = alignment.apply(cam_local)
         for kf, wc in zip(chunk_kfs, world_cam):
             kf._resolved_world_pose = wc  # noqa: SLF001 — internal bookkeeping between pipeline stages
             self._emit(EventType.TRAJECTORY_POINT, kind="camera", x=wc[0], y=wc[1])
+            self.artifacts.camera_track_enu.append(tuple(wc))
             if self.georeferenced and kf.gps_enu is not None:
                 self.gps_factors.append(align.GpsFactor(chunk=chunk_idx, cam_center_local=cam_local[len(self.gps_factors) % len(cam_local)], gps_enu=np.array(kf.gps_enu)))
 
@@ -678,15 +728,28 @@ class Pipeline:
             except Exception as e:
                 self._fallback("dense_point_cloud", e)
 
+        self.artifacts.add_geometry_sample(ChunkGeometrySample(
+            chunk_idx=chunk_idx, rgb=colors[0].copy(),
+            depth=result.points_world[0, ..., 2].copy(), confidence=result.confidence[0].copy(),
+            dynamic_mask=dynamic_mask[0].copy() if dynamic_mask is not None else None,
+        ))
+
         n_new = self.fusion_acc.add_chunk(
             points_world, colors, result.confidence, dynamic_mask=dynamic_mask,
             min_confidence=self.config.min_confidence,
         )
-        sample = min(len(points_world.reshape(-1, 3)), 5000)
-        flat_pts = points_world.reshape(-1, 3)[:sample]
-        flat_cols = colors.reshape(-1, 3)[:sample]
-        flat_conf = result.confidence.reshape(-1)[:sample]
-        self._emit(EventType.POINTCLOUD_GROWTH, points=flat_pts, colors=flat_cols, confidence=flat_conf)
+        # Full-resolution chunk, not downsampled — the inline viewer (see
+        # dashboard.py/inline_viewer.py) needs real data to stream, and it
+        # does its own LOD above 2M accumulated points. A too-small preview
+        # here would defeat the point of a "full-quality" live view.
+        flat_pts = points_world.reshape(-1, 3)
+        flat_cols = colors.reshape(-1, 3)
+        flat_conf = result.confidence.reshape(-1)
+        keep = np.isfinite(flat_pts).all(axis=1)
+        if dynamic_mask is not None:
+            keep &= ~dynamic_mask.reshape(-1)
+        self._emit(EventType.POINTCLOUD_GROWTH, points=flat_pts[keep], colors=flat_cols[keep], confidence=flat_conf[keep])
+        self.artifacts.point_count = len(self.fusion_acc)
         _ = n_new
 
     def _gpu1_worker(self) -> None:
@@ -713,6 +776,10 @@ class Pipeline:
 
         refined = align.refine_pose_graph(self.chunk_alignments, self.overlap_constraints, self.gps_factors, self.bus)
         self.chunk_alignments = refined
+        for i, ca in enumerate(refined):
+            record = self._chunk_alignment_records.get(i)
+            if record is not None:
+                record.rmse_after_m = ca.rmse_m
         rmses = [a.rmse_m for a in refined if a.rmse_m is not None]
         return float(np.mean(rmses)) if rmses else None
 
@@ -725,6 +792,8 @@ class Pipeline:
         def rec(status):
             self._export_statuses.append(status)
             self.report.add_output(status)
+            if status.ok and status.path is not None:
+                self.artifacts.output_paths[status.name] = str(status.path)
 
         rec(export.export_pointcloud_ply(cloud, out / "pointcloud.ply", self.bus))
         rec(export.export_pointcloud_las(cloud, out / "pointcloud.las", self.bus, self.epsg, self.georeferenced))
@@ -738,7 +807,14 @@ class Pipeline:
         dsm_status, ortho_status = export.export_dsm_orthomosaic(cloud, out, self.bus, self.epsg, self.georeferenced, cfg.dsm_cell_size_m)
         rec(dsm_status)
         rec(ortho_status)
-        rec(export.export_coverage(cloud, out, self.bus, self.epsg, self.georeferenced, cfg.dsm_cell_size_m))
+        coverage_status = export.export_coverage(cloud, out, self.bus, self.epsg, self.georeferenced, cfg.dsm_cell_size_m)
+        rec(coverage_status)
+        self._emit(
+            EventType.RASTERS_READY,
+            dsm_path=str(dsm_status.path) if dsm_status.ok else None,
+            orthomosaic_path=str(ortho_status.path) if ortho_status.ok else None,
+            coverage_path=str(coverage_status.path) if coverage_status.ok else None,
+        )
 
         gps_track = [kf.gps_enu for kf in keyframes if kf.gps_enu is not None]
         cam_track = [getattr(kf, "_resolved_world_pose", None) for kf in keyframes]

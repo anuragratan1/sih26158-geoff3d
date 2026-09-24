@@ -403,11 +403,27 @@ def refine_pose_graph(
         f"cost {result.cost:.3f}, {'converged' if result.success else 'did not fully converge'}"
     )
 
+    # Recompute each chunk's own RMSE against its GPS factors using the
+    # REFINED transform — the pre-refinement rmse_m on `initial` is not a
+    # valid "after" value (it was carried straight through here in an
+    # earlier version of this function, which is wrong: the whole point of
+    # refinement is that per-chunk residuals should change).
+    gps_by_chunk: dict[int, list[GpsFactor]] = {}
+    for gf in gps_factors:
+        gps_by_chunk.setdefault(gf.chunk, []).append(gf)
+
     refined = []
     for i, ca in enumerate(initial):
         s, R, t = unpack(result.x, i)
+        chunk_gps = gps_by_chunk.get(i, [])
+        if chunk_gps:
+            preds = np.array([s * (R @ gf.cam_center_local) + t for gf in chunk_gps])
+            targets = np.array([gf.gps_enu for gf in chunk_gps])
+            rmse_after = float(np.sqrt(np.mean(np.sum((preds - targets) ** 2, axis=1))))
+        else:
+            rmse_after = ca.rmse_m  # no GPS factors for this chunk — nothing to recompute against
         refined.append(ChunkAlignment(
             scale=s, R=R, t=t, mode=ca.mode, georeferenced=ca.georeferenced,
-            rmse_m=ca.rmse_m, gravity_source=ca.gravity_source, notes=ca.notes,
+            rmse_m=rmse_after, gravity_source=ca.gravity_source, notes=ca.notes,
         ))
     return refined

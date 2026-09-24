@@ -40,7 +40,8 @@ class EventType(str, Enum):
     SETUP_STAGE_FALLBACK = "setup_stage_fallback"
     SETUP_STAGE_ERROR = "setup_stage_error"
     INSTALL_PROGRESS = "install_progress"  # one per package: pending/installing/ok/failed + timing
-    TUNNEL_READY = "tunnel_ready"           # fullscreen_server.py: cloudflared URL (or failure) known
+    TUNNEL_READY = "tunnel_ready"           # fullscreen_server.py: cloudflared URL (or failure) known, for outputs/viewer.html
+    LIVE_PAGE_READY = "live_page_ready"     # live_page.py: cloudflared URL (or failure) known, for the live reconstruction page
     RASTERS_READY = "rasters_ready"         # export.py's DSM/orthomosaic/coverage paths, for the Rasters tab
 
 
