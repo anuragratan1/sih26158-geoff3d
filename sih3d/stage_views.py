@@ -285,41 +285,73 @@ def render_mesh_textured_model(artifacts: RunArtifacts) -> None:
 
 
 def _render_mesh_offscreen(mesh_path: str, plt) -> bool:
-    """Tries a real textured/shaded render via Open3D's offscreen
-    renderer, top-down + oblique (matching the point-cloud preview's two
-    views). Needs a working (EGL/OSMesa) headless GL context, which isn't
-    guaranteed on Kaggle — returns False (never raises past this function)
-    so the caller falls back to a flat wireframe."""
-    import open3d as o3d
-    import open3d.visualization.rendering as rendering
+    """Tries a real lit/shaded render via pyrender's EGL backend (GPU,
+    headless offscreen — see stage_views.render_showcase's
+    _make_pyrender_snapshot for why EGL and not Open3D/Vulkan: Open3D's
+    rendering.OffscreenRenderer needs a Vulkan loader that errored out on a
+    real Kaggle session with "Failed to load vulkan library!"). Top-down +
+    oblique, matching the point-cloud preview's two views. Raises on any
+    failure — the caller already wraps this call and falls back to a flat
+    matplotlib wireframe, so this deliberately does NOT swallow errors
+    itself. Returns False only for the "loaded fine but empty mesh" case."""
+    import os
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    import pyrender
+    import trimesh
 
-    mesh = o3d.io.read_triangle_mesh(mesh_path, enable_post_processing=True)
-    if len(mesh.vertices) == 0:
+    m = trimesh.load(mesh_path, process=False)
+    if hasattr(m, "geometry"):  # a Scene (e.g. GLB) — take the first mesh
+        m = next(iter(m.geometry.values()))
+    if len(m.vertices) == 0:
         return False
-    mesh.compute_vertex_normals()
+    if hasattr(m.visual, "to_color"):
+        try:
+            m.visual = m.visual.to_color()  # bakes a real UV texture into vertex colors, same as render_showcase
+        except Exception:
+            pass
 
-    center = mesh.get_center()
-    extent = np.asarray(mesh.get_max_bound()) - np.asarray(mesh.get_min_bound())
-    radius = float(np.linalg.norm(extent)) or 10.0
+    bounds = m.bounds  # (2, 3): min, max
+    center = (bounds[0] + bounds[1]) / 2.0
+    radius = float(np.linalg.norm(bounds[1] - bounds[0])) or 10.0
 
-    renderer = rendering.OffscreenRenderer(640, 480)
-    mat = rendering.MaterialRecord()
-    mat.shader = "defaultLit"
-    renderer.scene.add_geometry("mesh", mesh, mat)
-    renderer.scene.set_background([0.05, 0.06, 0.08, 1.0])
+    scene = pyrender.Scene(bg_color=[0.05, 0.06, 0.08, 1.0], ambient_light=[0.4, 0.4, 0.4])
+    scene.add(pyrender.Mesh.from_trimesh(m, smooth=False))
+    camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0, aspectRatio=640 / 480)
+    cam_node = scene.add(camera, pose=np.eye(4))
+    light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
+    light_node = scene.add(light, pose=np.eye(4))
+    renderer = pyrender.OffscreenRenderer(640, 480)
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-    views = [("Top-down", center + [0, 0, radius], [0, 1, 0]), ("Oblique", center + [radius, radius, radius], [0, 0, 1])]
-    for ax, (title, eye, up) in zip(axes, views):
-        renderer.scene.camera.look_at(center, eye, up)
-        img = renderer.render_to_image()
-        ax.imshow(np.asarray(img))
-        ax.set_title(f"Textured mesh — {title}", fontsize=9)
-        ax.axis("off")
-    plt.tight_layout()
-    plt.show()
-    plt.close(fig)
-    return True
+    def _look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
+        forward = target - eye
+        forward = forward / (np.linalg.norm(forward) or 1.0)
+        right = np.cross(forward, up)
+        right = right / (np.linalg.norm(right) or 1.0)
+        true_up = np.cross(right, forward)
+        pose = np.eye(4)
+        pose[:3, 0], pose[:3, 1], pose[:3, 2], pose[:3, 3] = right, true_up, -forward, eye
+        return pose
+
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+        views = [
+            ("Top-down", center + np.array([0.0, 0.0, radius]), np.array([0.0, 1.0, 0.0])),
+            ("Oblique", center + np.array([radius, radius, radius]), np.array([0.0, 0.0, 1.0])),  # Z-up: ENU convention
+        ]
+        for ax, (title, eye, up) in zip(axes, views):
+            pose = _look_at(eye, center, up)
+            scene.set_pose(cam_node, pose)
+            scene.set_pose(light_node, pose)
+            color, _depth = renderer.render(scene)
+            ax.imshow(color)
+            ax.set_title(f"Textured mesh — {title}", fontsize=9)
+            ax.axis("off")
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
+        return True
+    finally:
+        renderer.delete()
 
 
 def _render_mesh_wireframe(mesh_path: str, plt) -> None:
@@ -449,9 +481,10 @@ def _make_pyrender_snapshot(verts, faces, colors, points, point_colors, bounds, 
             return color
 
         _snapshot(0.0)  # force a real render now — surfaces EGL/context failures here, not mid-video
-        return _snapshot, renderer.delete
-    except Exception:
-        return None, (lambda: None)
+        return _snapshot, renderer.delete, None
+    except Exception as e:
+        import traceback
+        return None, (lambda: None), f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
 def _make_matplotlib_snapshot(verts, faces, colors, points, point_colors, bounds, plt, Poly3DCollection):
@@ -599,11 +632,12 @@ def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: in
         lo, hi = lo - pad, hi + pad
         bounds = list(zip(lo, hi))
 
-        _snapshot, cleanup = _make_pyrender_snapshot(verts, faces, colors, points, point_colors, bounds)
+        _snapshot, cleanup, pyrender_error = _make_pyrender_snapshot(verts, faces, colors, points, point_colors, bounds)
         if _snapshot is not None:
             print("Rendering via pyrender (GPU, EGL) — real lit/shaded geometry.")
         else:
             print("pyrender/EGL unavailable; falling back to matplotlib (flat-shaded, no GPU renderer needed).")
+            print(f"pyrender error was:\n{pyrender_error}")
             _snapshot, cleanup = _make_matplotlib_snapshot(verts, faces, colors, points, point_colors, bounds, plt, Poly3DCollection)
 
         print(f"Rendering {n_photos} stills...")

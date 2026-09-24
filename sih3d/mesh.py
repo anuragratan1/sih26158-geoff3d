@@ -219,11 +219,30 @@ def _poisson_worker(points, colors, normals, depth, result_queue) -> None:
         # Trim low-density (extrapolated/hallucinated) vertices at the
         # reconstruction's outer fringe — Poisson fills holes by design,
         # which without trimming produces a bloated blob past the actual
-        # observed surface.
-        keep = densities >= _np.quantile(densities, 0.02)
+        # observed surface. 2% was too lenient in practice: real drone
+        # footage over water produces sparse/noisy points there (water is
+        # reflective/textureless, so multi-view matching fails), and
+        # Poisson still tries to force a closed surface through that noise
+        # — visible as long spiky/hallucinated protrusions exactly over
+        # water in a real reconstruction. 12% cuts much more of that
+        # low-confidence fringe.
+        keep = densities >= _np.quantile(densities, 0.12)
         mesh.remove_vertices_by_mask(~keep)
         mesh.remove_degenerate_triangles()
         mesh.remove_unreferenced_vertices()
+
+        # Small disconnected fragments left over from the density trim
+        # above (isolated spike/hair clusters, not part of the main
+        # surface) — keep only clusters big enough to plausibly be real
+        # structure, not reconstruction noise.
+        triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+        triangle_clusters = _np.asarray(triangle_clusters)
+        cluster_n_triangles = _np.asarray(cluster_n_triangles)
+        if len(cluster_n_triangles) > 1:
+            min_cluster_triangles = max(50, int(0.005 * len(mesh.triangles)))
+            remove_mask = cluster_n_triangles[triangle_clusters] < min_cluster_triangles
+            mesh.remove_triangles_by_mask(remove_mask)
+            mesh.remove_unreferenced_vertices()
         result_queue.put((
             _np.asarray(mesh.vertices), _np.asarray(mesh.triangles),
             _np.asarray(mesh.vertex_colors) if mesh.has_vertex_colors() else None,
