@@ -84,24 +84,18 @@ def _start_http_server(directory: Path, port: int, bus: EventBus) -> None:
 _TRYCLOUDFLARE_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 
 
-def start_fullscreen_server(output_dir: Path, bus: EventBus, timeout_s: float = 20.0) -> str | None:
-    """Starts a local HTTP server over `output_dir` and a cloudflared quick
-    tunnel pointing at it. Returns the public https://*.trycloudflare.com
-    base URL (append "/viewer.html"), or None if anything failed."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        port = _free_port()
-        _start_http_server(output_dir, port, bus)
-    except Exception as e:
-        bus.log(f"Local HTTP server failed to start ({e}) — full-screen viewer unavailable", level="warn")
-        return None
-
+def start_cloudflared_tunnel(port: int, bus: EventBus, label: str = "tunnel", timeout_s: float = 20.0) -> str | None:
+    """Starts a cloudflared quick tunnel pointing at a local port already
+    listening on 127.0.0.1. Shared by start_fullscreen_server() (outputs/)
+    and live_page.py (the live reconstruction page) so the cloudflared
+    process-management/URL-parsing logic exists exactly once. Returns the
+    public https://*.trycloudflare.com URL, or None if anything failed —
+    logged, never raised."""
     cloudflared = shutil.which("cloudflared")
     if cloudflared is None and Path("/usr/local/bin/cloudflared").exists():
         cloudflared = "/usr/local/bin/cloudflared"
     if cloudflared is None:
-        bus.log("cloudflared not available — full-screen viewer link unavailable (inline viewer still works)", level="warn")
+        bus.log(f"cloudflared not available — {label} link unavailable", level="warn")
         return None
 
     try:
@@ -110,7 +104,7 @@ def start_fullscreen_server(output_dir: Path, bus: EventBus, timeout_s: float = 
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
     except Exception as e:
-        bus.log(f"cloudflared failed to start ({e}) — full-screen viewer link unavailable", level="warn")
+        bus.log(f"cloudflared failed to start ({e}) — {label} link unavailable", level="warn")
         return None
 
     url = None
@@ -127,7 +121,7 @@ def start_fullscreen_server(output_dir: Path, bus: EventBus, timeout_s: float = 
             break
 
     if url is None:
-        bus.log(f"cloudflared did not produce a tunnel URL within {timeout_s:.0f}s — full-screen viewer link unavailable", level="warn")
+        bus.log(f"cloudflared did not produce a tunnel URL within {timeout_s:.0f}s — {label} link unavailable", level="warn")
         try:
             proc.terminate()
         except Exception:
@@ -141,7 +135,23 @@ def start_fullscreen_server(output_dir: Path, bus: EventBus, timeout_s: float = 
         except Exception:
             pass
 
-    threading.Thread(target=_drain_stdout, daemon=True, name="sih3d-cloudflared-drain").start()
+    threading.Thread(target=_drain_stdout, daemon=True, name=f"sih3d-cloudflared-drain-{label}").start()
 
-    bus.log(f"Full-screen viewer tunnel ready: {url}")
+    bus.log(f"{label} tunnel ready: {url}")
     return url
+
+
+def start_fullscreen_server(output_dir: Path, bus: EventBus, timeout_s: float = 20.0) -> str | None:
+    """Starts a local HTTP server over `output_dir` and a cloudflared quick
+    tunnel pointing at it. Returns the public https://*.trycloudflare.com
+    base URL (append "/viewer.html"), or None if anything failed."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        port = _free_port()
+        _start_http_server(output_dir, port, bus)
+    except Exception as e:
+        bus.log(f"Local HTTP server failed to start ({e}) — full-screen viewer unavailable", level="warn")
+        return None
+
+    return start_cloudflared_tunnel(port, bus, label="full-screen viewer", timeout_s=timeout_s)
