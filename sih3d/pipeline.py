@@ -102,6 +102,7 @@ class PipelineConfig:
     keyframe_sample_fps: float = 4.0
     decode_working_width: int = 1920
     watchdog_stall_s: float = 60.0
+    dual_gpu: bool = False
 
 
 @dataclass
@@ -224,6 +225,12 @@ class Pipeline:
         self.two_gpu = gpu_monitor.device_count >= 2
         self.fusion_acc = VoxelPointFusion(config.voxel_size_m, device=config.device0)
         self.masker: masks.DynamicObjectMasker | None = None
+        self.masker0: masks.DynamicObjectMasker | None = None  # DUAL_GPU only — device0's own masker, alongside self.masker on device1
+
+        # DUAL_GPU idle-wait tracking, keyed by device string — logged and
+        # surfaced in the final summary so "is a GPU actually busy" has a
+        # real answer instead of just eyeballing the dashboard's SM% graph.
+        self._gpu_idle_s: dict[str, float] = {}
 
         self.chunk_alignments: list[align.ChunkAlignment] = []
         self.overlap_constraints: list[align.OverlapConstraint] = []
@@ -364,6 +371,8 @@ class Pipeline:
 
         if self.two_gpu:
             self.masker = masks.DynamicObjectMasker(self.bus, device=cfg.device1)
+            if cfg.dual_gpu:
+                self.masker0 = masks.DynamicObjectMasker(self.bus, device=cfg.device0)
 
         # -- Stage: frame_extraction -------------------------------------
         # Backbone selection/loading is deliberately NOT done before this
@@ -410,12 +419,23 @@ class Pipeline:
         chunks = self._make_chunks(keyframes)
         self._log(f"Chunked {len(keyframes)} keyframes into {len(chunks)} chunk(s) (size={cfg.chunk_size}, overlap={cfg.chunk_overlap})")
 
+        dual_gpu = cfg.dual_gpu and self.two_gpu
+        if cfg.dual_gpu and not self.two_gpu:
+            self._log("DUAL_GPU requested but fewer than 2 GPUs detected — running single-GPU", level="warn")
+
         # Backbone selection is the one allowed-fatal setup step, and the
         # only thing here allowed to put multi-GB of weights on device0 —
         # deliberately done only now, right before the chunk loop that's
         # the first thing to actually need it (see the frame_extraction
         # comment above for why: it used to run before frame extraction
-        # and OOM'd there on a real 4K Kaggle run).
+        # and OOM'd there on a real 4K Kaggle run). DUAL_GPU loads a second,
+        # fully independent instance on device1 too — sequentially, not
+        # via two parallel loads: both instances fetch the SAME pretrained
+        # weights, and racing two concurrent downloads into a possibly-cold
+        # shared HuggingFace cache is a real corruption risk not worth
+        # taking in a code path with no real hardware to test that race
+        # against here.
+        bb1 = None
         if self._backbone_override is not None:
             bb, prior_mode = self._backbone_override
         else:
@@ -423,49 +443,66 @@ class Pipeline:
                 cfg.backbone_choice, cfg.prior_mode, self.detected, self.bus,
                 device=cfg.device0, use_finetuned=cfg.use_finetuned,
             )
+            if dual_gpu:
+                bb1, prior_mode1 = backbone_mod.select_backbone(
+                    cfg.backbone_choice, cfg.prior_mode, self.detected, self.bus,
+                    device=cfg.device1, use_finetuned=cfg.use_finetuned,
+                )
+                if prior_mode1 != prior_mode:
+                    self._log(
+                        f"DUAL_GPU: device1 backbone resolved prior_mode={prior_mode1.value}, "
+                        f"device0 resolved {prior_mode.value} — using device0's for both", level="warn",
+                    )
         self.report.set_run_config(
             mode=cfg.mode, backbone=bb.name, prior_mode=prior_mode.value,
             checkpoint_source=getattr(bb, "checkpoint_source", "pretrained"),
             gpus=self.gpu_monitor.device_names,
         )
 
-        self._gpu1_thread = None
-        if self.two_gpu:
-            self._gpu1_thread = threading.Thread(target=self._gpu1_worker, name="sih3d-gpu1-worker", daemon=True)
-            self._gpu1_thread.start()
-
         self._emit(EventType.STAGE_START, stage="geometric_reconstruction")
         self._emit(EventType.STAGE_START, stage="large_scale_alignment")
         self._emit(EventType.STAGE_START, stage="dense_point_cloud")
+        geom_stage_t0 = time.time()
 
-        for chunk_idx, chunk_kfs in enumerate(chunks):
-            if self.stop_event.is_set():
-                break
-            chunk_result = self._process_chunk(bb, prior_mode, chunk_kfs, chunk_idx)
-            frac = (chunk_idx + 1) / len(chunks)
-            self._emit(EventType.STAGE_PROGRESS, stage="geometric_reconstruction", frac=frac)
-            self._emit(EventType.STAGE_PROGRESS, stage="large_scale_alignment", frac=frac)
+        if dual_gpu and bb1 is not None:
+            self._run_chunks_dual_gpu(chunks, bb, bb1, prior_mode)
+        else:
+            self._gpu1_thread = None
+            if self.two_gpu:
+                self._gpu1_thread = threading.Thread(target=self._gpu1_worker, name="sih3d-gpu1-worker", daemon=True)
+                self._gpu1_thread.start()
 
-            if chunk_result is None:
-                continue
+            for chunk_idx, chunk_kfs in enumerate(chunks):
+                if self.stop_event.is_set():
+                    break
+                chunk_result = self._process_chunk(bb, prior_mode, chunk_kfs, chunk_idx)
+                frac = (chunk_idx + 1) / len(chunks)
+                self._emit(EventType.STAGE_PROGRESS, stage="geometric_reconstruction", frac=frac)
+                self._emit(EventType.STAGE_PROGRESS, stage="large_scale_alignment", frac=frac)
+
+                if chunk_result is None:
+                    continue
+
+                if self.two_gpu:
+                    try:
+                        self._chunk_queue.put((chunk_idx, chunk_kfs, chunk_result), timeout=30)
+                    except queue.Full:
+                        self._fallback("dense_point_cloud", RuntimeError("GPU1 worker queue full/stalled; dropping chunk"))
+                else:
+                    self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, chunk_result)
+                    self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac)
 
             if self.two_gpu:
-                try:
-                    self._chunk_queue.put((chunk_idx, chunk_kfs, chunk_result), timeout=30)
-                except queue.Full:
-                    self._fallback("dense_point_cloud", RuntimeError("GPU1 worker queue full/stalled; dropping chunk"))
-            else:
-                self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, chunk_result)
-                self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac)
-
-        if self.two_gpu:
-            self._chunk_queue.put(self._SENTINEL)
-            if self._gpu1_thread:
-                self._gpu1_thread.join(timeout=300)
+                self._chunk_queue.put(self._SENTINEL)
+                if self._gpu1_thread:
+                    self._gpu1_thread.join(timeout=300)
 
         self._emit(EventType.STAGE_DONE, stage="geometric_reconstruction")
         self._emit(EventType.STAGE_DONE, stage="large_scale_alignment")
         self._emit(EventType.STAGE_DONE, stage="dense_point_cloud")
+
+        if dual_gpu:
+            self._report_dual_gpu_utilization(geom_stage_t0)
 
         alignment_rmse = None
         try:
@@ -680,7 +717,17 @@ class Pipeline:
 
     # -- per-chunk processing ----------------------------------------------
 
-    def _process_chunk(self, bb, prior_mode: PriorMode, chunk_kfs: list[PreparedKeyframe], chunk_idx: int) -> ChunkResult | None:
+    def _infer_chunk_backbone(
+        self, bb, prior_mode: PriorMode, chunk_kfs: list[PreparedKeyframe], chunk_idx: int,
+    ) -> tuple[list[PreparedKeyframe], ChunkResult | None]:
+        """Backbone inference only — no alignment. Split out from
+        `_process_chunk` (which still does inference+alignment together,
+        for the single-GPU path, unchanged) so DUAL_GPU's two backbone
+        worker threads can call this directly and hand the raw result to
+        a single ordered "stitcher" step instead — alignment carries
+        state between consecutive chunks (`_prev_chunk_cam_local`), so it
+        must stay strictly sequential even when inference itself runs in
+        parallel across two GPUs."""
         cfg = self.config
         views = [
             ViewInput(
@@ -700,7 +747,7 @@ class Pipeline:
             except RuntimeError as e:
                 if "out of memory" in str(e).lower() and chunk_size > 2:
                     chunk_size = max(chunk_size // 2, 2)
-                    self._log(f"OOM on chunk {chunk_idx} — halving to {chunk_size} views and retrying", level="warn")
+                    self._log(f"OOM on chunk {chunk_idx} (device {getattr(bb, 'device', '?')}) — halving to {chunk_size} views and retrying", level="warn")
                     self._emit(EventType.STAGE_FALLBACK, stage="geometric_reconstruction", note=f"OOM, halved chunk to {chunk_size}")
                     views = views[:chunk_size]
                     try:
@@ -711,12 +758,17 @@ class Pipeline:
                         pass
                     continue
                 self._fallback("geometric_reconstruction", e)
-                return None
+                return chunk_kfs[:chunk_size], None
             except Exception as e:
                 self._fallback("geometric_reconstruction", e)
-                return None
+                return chunk_kfs[:chunk_size], None
 
-        chunk_kfs = chunk_kfs[:chunk_size]
+        return chunk_kfs[:chunk_size], result
+
+    def _finish_chunk_alignment(self, chunk_kfs: list[PreparedKeyframe], result: ChunkResult, chunk_idx: int) -> None:
+        """Alignment + the live geometry preview — the sequential tail end
+        of processing one chunk, called from the single-GPU path's loop
+        directly (via _process_chunk) or from DUAL_GPU's ordered stitcher."""
         try:
             self._align_chunk(chunk_kfs, result, chunk_idx)
         except Exception as e:
@@ -726,6 +778,11 @@ class Pipeline:
         conf_preview = result.confidence[0] if len(result.confidence) else None
         self._emit(EventType.GEOMETRY_CHUNK, depth=depth_preview, confidence=conf_preview)
 
+    def _process_chunk(self, bb, prior_mode: PriorMode, chunk_kfs: list[PreparedKeyframe], chunk_idx: int) -> ChunkResult | None:
+        chunk_kfs, result = self._infer_chunk_backbone(bb, prior_mode, chunk_kfs, chunk_idx)
+        if result is None:
+            return None
+        self._finish_chunk_alignment(chunk_kfs, result, chunk_idx)
         return result
 
     def _scale_intrinsics(self, K: np.ndarray, orig_shape: tuple, target_size: int) -> np.ndarray:
@@ -819,7 +876,17 @@ class Pipeline:
 
     # -- masking + fusion (inline or GPU1 worker) ---------------------------
 
-    def _mask_and_fuse_chunk(self, chunk_idx: int, chunk_kfs: list[PreparedKeyframe], result: ChunkResult) -> None:
+    def _mask_and_fuse_chunk(
+        self, chunk_idx: int, chunk_kfs: list[PreparedKeyframe], result: ChunkResult,
+        masker: "masks.DynamicObjectMasker | None" = None,
+    ) -> None:
+        """`masker` defaults to `self.masker` (the single-GPU/GPU1-worker
+        behavior, unchanged) — DUAL_GPU's stitcher passes `self.masker0`
+        or `self.masker` explicitly per chunk instead, so masking runs on
+        whichever GPU actually produced that chunk's geometry rather than
+        being pinned to one device."""
+        if masker is None:
+            masker = self.masker
         alignment = self.chunk_alignments[chunk_idx] if chunk_idx < len(self.chunk_alignments) else None
         if alignment is None:
             return
@@ -828,9 +895,9 @@ class Pipeline:
         colors = np.stack([_resize_for_backbone(kf.image_full, points_world.shape[1]) for kf in chunk_kfs], axis=0)
 
         dynamic_mask = None
-        if self.masker is not None:
+        if masker is not None:
             try:
-                masks_list = [self.masker.mask_frame(colors[i]).mask for i in range(len(chunk_kfs))]
+                masks_list = [masker.mask_frame(colors[i]).mask for i in range(len(chunk_kfs))]
                 dynamic_mask = np.stack(masks_list, axis=0)
             except Exception as e:
                 self._fallback("dense_point_cloud", e)
@@ -894,6 +961,131 @@ class Pipeline:
                 self._fallback("dense_point_cloud", e)
             frac = None
             self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=1.0)
+
+    # -- DUAL_GPU: data-parallel backbone across both GPUs -------------------
+
+    def _run_chunks_dual_gpu(self, chunks: list, bb0, bb1, prior_mode: PriorMode) -> None:
+        """Even chunks run backbone inference on device0, odd chunks on
+        device1, concurrently — chunk-local geometry is independent of
+        other chunks (only alignment carries state between them), so this
+        is safe. Alignment/masking/fusion then happen in ONE ordered
+        "stitcher" loop (this method's own thread) that waits for each
+        chunk_idx in turn: exactly the same single-writer guarantee the
+        single-GPU path already relies on for `chunk_alignments`,
+        `fusion_acc`, and `_prev_chunk_cam_local`, just fed by two
+        producers instead of one.
+
+        An OOM on either GPU is handled entirely within that GPU's own
+        worker (via _infer_chunk_backbone's existing halve-and-retry) —
+        it never touches the other GPU's queue, so a bad chunk on device1
+        never demotes device0 to running solo.
+
+        Known scope limit, stated plainly: "prefetch" here means each
+        GPU's queue can hold a few chunks of lookahead (dispatch is
+        decoupled from inference, so the next chunk is already queued
+        the moment a worker is free) — it does NOT mean pinned-memory,
+        non_blocking CPU->GPU tensor transfers inside the backbone's own
+        inference call, which would require changes to backbone.py's
+        model-loading internals that can't be verified without real GPU
+        hardware. The queue-level prefetch is what actually keeps a GPU
+        from sitting idle between chunks; the pinned-memory piece is a
+        finer-grained optimization on top that's deferred.
+        """
+        cfg = self.config
+        n = len(chunks)
+        q0: "queue.Queue" = queue.Queue(maxsize=3)
+        q1: "queue.Queue" = queue.Queue(maxsize=3)
+        results: dict[int, tuple[list[PreparedKeyframe], ChunkResult | None]] = {}
+        results_cv = threading.Condition()
+        stop = self.stop_event
+
+        def worker(bb, q: "queue.Queue", device_label: str) -> None:
+            while True:
+                wait_t0 = time.time()
+                item = q.get()
+                waited = time.time() - wait_t0
+                self._gpu_idle_s[device_label] = self._gpu_idle_s.get(device_label, 0.0) + waited
+                if waited > 5.0:
+                    self.bus.log(f"{device_label} waited {waited:.1f}s for its next chunk (other GPU/dispatch is the bottleneck)", level="warn")
+                if item is self._SENTINEL:
+                    break
+                chunk_idx, chunk_kfs = item
+                if stop.is_set():
+                    with results_cv:
+                        results[chunk_idx] = (chunk_kfs, None)
+                        results_cv.notify_all()
+                    continue
+                trimmed_kfs, result = self._infer_chunk_backbone(bb, prior_mode, chunk_kfs, chunk_idx)
+                with results_cv:
+                    results[chunk_idx] = (trimmed_kfs, result)
+                    results_cv.notify_all()
+
+        def dispatch() -> None:
+            for chunk_idx, chunk_kfs in enumerate(chunks):
+                if stop.is_set():
+                    break
+                (q0 if chunk_idx % 2 == 0 else q1).put((chunk_idx, chunk_kfs))
+            q0.put(self._SENTINEL)
+            q1.put(self._SENTINEL)
+
+        dispatch_thread = threading.Thread(target=dispatch, name="sih3d-dual-dispatch", daemon=True)
+        worker0_thread = threading.Thread(target=worker, args=(bb0, q0, f"backbone-worker[{cfg.device0}]"), name="sih3d-backbone0", daemon=True)
+        worker1_thread = threading.Thread(target=worker, args=(bb1, q1, f"backbone-worker[{cfg.device1}]"), name="sih3d-backbone1", daemon=True)
+        dispatch_thread.start()
+        worker0_thread.start()
+        worker1_thread.start()
+
+        for chunk_idx in range(n):
+            if stop.is_set():
+                break
+            with results_cv:
+                while chunk_idx not in results and not stop.is_set():
+                    results_cv.wait(timeout=5.0)
+                if chunk_idx not in results:
+                    break
+                chunk_kfs, result = results.pop(chunk_idx)
+
+            frac = (chunk_idx + 1) / n
+            self._emit(EventType.STAGE_PROGRESS, stage="geometric_reconstruction", frac=frac)
+            self._emit(EventType.STAGE_PROGRESS, stage="large_scale_alignment", frac=frac)
+
+            if result is None:
+                continue
+
+            self._finish_chunk_alignment(chunk_kfs, result, chunk_idx)
+            # Masking runs on whichever GPU produced this chunk's geometry
+            # — device0's own masker for even chunks, device1's for odd —
+            # rather than pinned to one device, so masking work is spread
+            # across both GPUs instead of bottlenecking on one.
+            masker = self.masker0 if (chunk_idx % 2 == 0) else self.masker
+            self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, result, masker=masker)
+            self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac)
+
+        dispatch_thread.join(timeout=60)
+        worker0_thread.join(timeout=300)
+        worker1_thread.join(timeout=300)
+
+    def _report_dual_gpu_utilization(self, stage_t0: float) -> None:
+        """Logs per-GPU average SM utilization + near-idle fraction over
+        the just-finished chunk-processing window, flagging anything
+        under the >70% avg / >20% idle targets. The same numbers are
+        also in report.json per-stage (avg_gpu_util_pct, already computed
+        from the same GPU_SAMPLE history) for anyone inspecting the file
+        directly rather than the live log."""
+        t1 = time.time()
+        for idx in range(self.gpu_monitor.device_count):
+            avg = self.gpu_monitor.history.average_util(idx, stage_t0, t1)
+            idle_frac = self.gpu_monitor.history.idle_fraction(idx, stage_t0, t1, idle_below_pct=5.0)
+            if avg is None:
+                continue
+            note = f"DUAL_GPU: GPU{idx} averaged {avg:.0f}% SM utilization during geometry processing"
+            if idle_frac is not None:
+                note += f" ({idle_frac * 100:.0f}% of samples near-idle)"
+            flagged = avg < 70.0 or (idle_frac or 0.0) > 0.20
+            self._log(note, level="warn" if flagged else "info")
+        for device_label, idle_s in self._gpu_idle_s.items():
+            if idle_s > 1.0:
+                self._log(f"DUAL_GPU: {device_label} spent {idle_s:.1f}s total waiting for its input queue", level="warn" if idle_s > 10 else "info")
 
     # -- global alignment refinement -----------------------------------------
 

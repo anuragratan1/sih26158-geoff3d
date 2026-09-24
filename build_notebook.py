@@ -87,6 +87,16 @@ PRIOR_MODE = "AUTO"
 # it as a dataset). Falls back to the stock pretrained backbone otherwise.
 USE_FINETUNED_CHECKPOINT = True
 
+# Off by default: data-parallel backbone across both GPUs (even chunks on
+# cuda:0, odd on cuda:1, each with its own prefetch queue; alignment stays
+# single-threaded/ordered afterward, since it carries state between
+# consecutive chunks). Ignored with a warning if fewer than 2 GPUs are
+# detected. Kept behind this flag rather than auto-enabled on 2 GPUs so a
+# single-GPU-backbone baseline run stays available on demand, unmixed with
+# the dual-GPU path's own behavior (double model load time, split logs, a
+# DUAL_GPU utilization summary at the end of geometric_reconstruction).
+DUAL_GPU = False
+
 # Off by default per the task spec: a viser server with a public share URL
 # for a full-resolution external live-3D view. Never blocks/crashes the
 # pipeline if it fails to start (falls back to cloudflared, then just skips).
@@ -96,7 +106,7 @@ INPUT_ROOT = "/kaggle/input"
 OUTPUT_DIR = "/kaggle/working/outputs"
 CACHE_DIR = "/kaggle/working/cache"
 
-print(f"MODE={MODE}  BACKBONE={BACKBONE}  PRIOR_MODE={PRIOR_MODE}  USE_FINETUNED_CHECKPOINT={USE_FINETUNED_CHECKPOINT}")
+print(f"MODE={MODE}  BACKBONE={BACKBONE}  PRIOR_MODE={PRIOR_MODE}  USE_FINETUNED_CHECKPOINT={USE_FINETUNED_CHECKPOINT}  DUAL_GPU={DUAL_GPU}")
 '''
 
 SETUP_CELL = '''
@@ -348,6 +358,7 @@ cfg = PipelineConfig(
     use_finetuned=USE_FINETUNED_CHECKPOINT, output_dir=Path(OUTPUT_DIR),
     device0="cuda:0" if gpu_monitor.device_count >= 1 else "cpu",
     device1="cuda:1" if gpu_monitor.device_count >= 2 else ("cuda:0" if gpu_monitor.device_count >= 1 else "cpu"),
+    dual_gpu=DUAL_GPU,
 )
 
 header_info = {
