@@ -260,9 +260,10 @@ def render_mesh_textured_model(artifacts: RunArtifacts) -> None:
 
 def _render_mesh_offscreen(mesh_path: str, plt) -> bool:
     """Tries a real textured/shaded render via Open3D's offscreen
-    renderer. Needs a working (EGL/OSMesa) headless GL context, which
-    isn't guaranteed on Kaggle — returns False (never raises past this
-    function) so the caller falls back to a flat wireframe."""
+    renderer, top-down + oblique (matching the point-cloud preview's two
+    views). Needs a working (EGL/OSMesa) headless GL context, which isn't
+    guaranteed on Kaggle — returns False (never raises past this function)
+    so the caller falls back to a flat wireframe."""
     import open3d as o3d
     import open3d.visualization.rendering as rendering
 
@@ -271,19 +272,24 @@ def _render_mesh_offscreen(mesh_path: str, plt) -> bool:
         return False
     mesh.compute_vertex_normals()
 
+    center = mesh.get_center()
+    extent = np.asarray(mesh.get_max_bound()) - np.asarray(mesh.get_min_bound())
+    radius = float(np.linalg.norm(extent)) or 10.0
+
     renderer = rendering.OffscreenRenderer(640, 480)
     mat = rendering.MaterialRecord()
     mat.shader = "defaultLit"
     renderer.scene.add_geometry("mesh", mesh, mat)
-    renderer.scene.camera.look_at(mesh.get_center(), mesh.get_center() + [10, 10, 10], [0, 0, 1])
     renderer.scene.set_background([0.05, 0.06, 0.08, 1.0])
-    img = renderer.render_to_image()
-    arr = np.asarray(img)
 
-    fig, ax = plt.subplots(figsize=(6, 4.5))
-    ax.imshow(arr)
-    ax.set_title("Textured mesh (offscreen render)", fontsize=9)
-    ax.axis("off")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    views = [("Top-down", center + [0, 0, radius], [0, 1, 0]), ("Oblique", center + [radius, radius, radius], [0, 0, 1])]
+    for ax, (title, eye, up) in zip(axes, views):
+        renderer.scene.camera.look_at(center, eye, up)
+        img = renderer.render_to_image()
+        ax.imshow(np.asarray(img))
+        ax.set_title(f"Textured mesh — {title}", fontsize=9)
+        ax.axis("off")
     plt.tight_layout()
     plt.show()
     plt.close(fig)
@@ -291,8 +297,8 @@ def _render_mesh_offscreen(mesh_path: str, plt) -> bool:
 
 
 def _render_mesh_wireframe(mesh_path: str, plt) -> None:
-    """Flat-shaded matplotlib fallback: no texture, but shows real
-    geometry/vertex colors, and never needs a GL context."""
+    """Flat-shaded matplotlib fallback, top-down + oblique: no texture,
+    but shows real geometry/vertex colors, and never needs a GL context."""
     import trimesh
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -310,15 +316,18 @@ def _render_mesh_wireframe(mesh_path: str, plt) -> None:
         vc = np.asarray(m.visual.vertex_colors)[:, :3] / 255.0
         face_colors = vc[faces].mean(axis=1)
 
-    fig = plt.figure(figsize=(6, 4.5))
-    ax = fig.add_subplot(111, projection="3d")
-    poly = Poly3DCollection(verts[faces], facecolor=face_colors if face_colors is not None else "#888888", linewidths=0)
-    ax.add_collection3d(poly)
-    ax.set_xlim(verts[:, 0].min(), verts[:, 0].max())
-    ax.set_ylim(verts[:, 1].min(), verts[:, 1].max())
-    ax.set_zlim(verts[:, 2].min(), verts[:, 2].max())
-    ax.set_title("Mesh (flat-shaded fallback, no texture)", fontsize=9)
-    ax.set_axis_off()
+    fig = plt.figure(figsize=(11, 5))
+    views = [("Top-down", 89, -90), ("Oblique", 25, -60)]
+    for i, (title, elev, azim) in enumerate(views, start=1):
+        ax = fig.add_subplot(1, 2, i, projection="3d")
+        poly = Poly3DCollection(verts[faces], facecolor=face_colors if face_colors is not None else "#888888", linewidths=0)
+        ax.add_collection3d(poly)
+        ax.set_xlim(verts[:, 0].min(), verts[:, 0].max())
+        ax.set_ylim(verts[:, 1].min(), verts[:, 1].max())
+        ax.set_zlim(verts[:, 2].min(), verts[:, 2].max())
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(f"Mesh (flat-shaded fallback) — {title}", fontsize=9)
+        ax.set_axis_off()
     plt.tight_layout()
     plt.show()
     plt.close(fig)

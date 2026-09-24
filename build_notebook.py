@@ -39,6 +39,13 @@ def writefile_cell(path: Path) -> "nbf.NotebookNode":
     of hand-copying them."""
     rel = path.relative_to(ROOT).as_posix()
     content = path.read_text()
+    if not content:
+        # IPython's %%writefile magic raises "UsageError: cell body is
+        # empty" for a truly empty cell body (confirmed via nbconvert
+        # --execute — sih3d/vendor/__init__.py and friends are legitimately
+        # empty files). A single newline round-trips to an empty-for-Python-
+        # purposes __init__.py while giving the magic a non-empty body.
+        content = "\n"
     return nbf.v4.new_code_cell(f"%%writefile {rel}\n" + content)
 
 
@@ -92,15 +99,23 @@ CACHE_DIR = "/kaggle/working/cache"
 print(f"MODE={MODE}  BACKBONE={BACKBONE}  PRIOR_MODE={PRIOR_MODE}  USE_FINETUNED_CHECKPOINT={USE_FINETUNED_CHECKPOINT}")
 '''
 
-ENV_CHECK_CELL = '''
-# ============================== ENVIRONMENT CHECKS =========================
-# Fail fast with a clear message rather than a confusing error deep inside
-# the pipeline — per the task's "speed of setup" requirement.
+SETUP_CELL = '''
+# ============================== SETUP: env check, install, detect inputs ====
+# One cell, top to bottom: environment checks -> install only what's missing
+# -> detect the video/telemetry/checkpoints already attached under
+# /kaggle/input -> ready for the Launch cell below. Kaggle's image already
+# has torch preinstalled — nothing here reinstalls/pins it (GeoFF3D's own
+# pyproject pins torch==2.5.0, exactly the kind of forced-reinstall the task
+# spec says to avoid; see PHASE0_NOTES.md section 4).
+import importlib
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 _t0 = time.time()
+
+# -- 1. environment checks ---------------------------------------------------
 
 def _check_internet(timeout_s: float = 5.0) -> bool:
     import urllib.request
@@ -122,7 +137,6 @@ def _check_gpu() -> tuple[bool, str]:
 
 _internet_ok = _check_internet()
 _gpu_ok, _gpu_info = _check_gpu()
-
 print(f"Internet: {'ON' if _internet_ok else 'OFF'}")
 print(f"GPU(s):\\n{_gpu_info if _gpu_ok else '(none detected)'}")
 
@@ -130,53 +144,23 @@ if not _internet_ok:
     raise RuntimeError(
         "Internet is OFF for this notebook session. Enable it under "
         "Notebook Settings -> Internet -> On, then Run All again. "
-        "Model weights (Pi3X/MapAnything) and pip installs need it."
+        "Model weights (MapAnything) and pip installs need it."
     )
 if not _gpu_ok:
-    print(
-        "WARNING: no GPU detected (nvidia-smi found nothing). The pipeline will "
-        "still run on CPU as a last-resort fallback, but this will be VERY slow "
-        "and QUICK mode's <5min target will not be met. Enable a GPU under "
-        "Notebook Settings -> Accelerator."
-    )
-
-print(f"Environment checks done in {time.time()-_t0:.1f}s")
-'''
-
-DIR_SETUP_CELL = '''
-# ============================== PACKAGE DIRECTORIES =========================
-# %%writefile does not create parent directories, so create every directory
-# the following cells will write into, up front.
-from pathlib import Path
-
-for _d in {dirs}:
-    Path(_d).mkdir(parents=True, exist_ok=True)
-print("sih3d/ package directories ready")
-'''
-
-INSTALL_CELL = '''
-# ============================== INSTALL (only what's missing) ===============
-# Kaggle's image already has torch preinstalled — we deliberately do NOT
-# pin/reinstall it (GeoFF3D's own pyproject pins torch==2.5.0, which is
-# exactly the kind of forced-reinstall the task spec says to avoid; see
-# PHASE0_NOTES.md section 4). Everything below is installed with --no-deps
-# where the package's own deps would risk pulling in a different torch.
-import importlib
-import subprocess
-import sys
-import time
-
-from pathlib import Path
+    print("WARNING: no GPU detected. The pipeline will still run on CPU as a "
+          "last-resort fallback, but this will be VERY slow. Enable a GPU "
+          "under Notebook Settings -> Accelerator.")
 
 sys.path.insert(0, str(Path.cwd()))
+
+# -- 2. install ---------------------------------------------------------------
+
 from sih3d.io_detect import find_cache_dir  # noqa: E402
 
 _cache_ds = find_cache_dir(Path(INPUT_ROOT))
+_pip_extra = ["--find-links", str(_cache_ds)] if _cache_ds is not None else []
 if _cache_ds is not None:
-    print(f"Found a cache dataset at {_cache_ds} — pip will prefer any wheels there and skip re-downloading.")
-    _pip_extra = ["--find-links", str(_cache_ds)]
-else:
-    _pip_extra = []
+    print(f"\\nFound a cache dataset at {_cache_ds} — pip will prefer any wheels there and skip re-downloading.")
 
 def _try_import(module_name: str) -> bool:
     try:
@@ -199,7 +183,7 @@ def _pip_install(spec: str, extra_args: list[str] | None = None, label: str | No
     except Exception as e:
         print(f"  [FAILED, {time.time()-t0:.0f}s] {label}: {e}")
 
-print("Checking/installing dependencies (only what's missing)...")
+print("\\nChecking/installing dependencies (only what's missing)...")
 
 # Core numeric/vision/geo stack (no torch dependency in any of these).
 _simple_deps = [
@@ -215,70 +199,58 @@ for _mod, _pkg in _simple_deps:
     else:
         print(f"  [already present] {_pkg}")
 
-# GPU-accelerated video decode (best-effort; decode.py falls back to
-# ffmpeg CUDA, then plain CPU decode if these aren't installable).
+# GPU-accelerated video decode (best-effort; decode.py falls back to ffmpeg
+# CUDA, then plain CPU decode if this isn't installable).
 if not _try_import("torchcodec"):
     _pip_install("torchcodec", label="torchcodec (optional GPU decode)")
 
-# Dynamic-object masking (best-effort; masks.py degrades to all-static if
-# unavailable).
+# Dynamic-object masking (best-effort; masks.py degrades to all-static).
 if not _try_import("ultralytics"):
     _pip_install("ultralytics", label="ultralytics (YOLO-seg masking)")
 
-# MapAnything (Backbone C) — confirmed in PHASE0_NOTES.md to have no
-# torch/CUDA pin at all, so a plain pip install from GitHub is safe.
+# MapAnything (Backbone C, the default) — a PLAIN pip install, no --no-deps
+# and no hand-picked extra-deps list: PHASE0_NOTES.md confirmed its own
+# pyproject has no torch/CUDA pin, so letting pip resolve its declared deps
+# itself (rather than guessing which ones it needs) is both simpler and
+# more correct than maintaining a hand-picked list that can drift from the
+# upstream pyproject.
 if not _try_import("mapanything"):
-    _pip_install("git+https://github.com/facebookresearch/map-anything.git",
-                 extra_args=["--no-deps"], label="mapanything (Backbone C)")
-    # mapanything's own non-torch deps (opencv-python-headless, trimesh,
-    # rerun-sdk, hydra-core, uniception, etc.) — installed separately with
-    # --no-deps above specifically to avoid pulling in a different torch.
-    for _pkg in ["opencv-python-headless", "hydra-core", "omegaconf", "uniception", "roma"]:
-        if not _try_import(_pkg.replace("-", "_")):
-            _pip_install(_pkg)
+    _pip_install("git+https://github.com/facebookresearch/map-anything.git", label="mapanything (Backbone C)")
 
-print(f"\\nInstalls done. If anything above FAILED, the corresponding pipeline "
-      f"stage will log a fallback rather than crash — check report.json after the run.")
-'''
+# Verify MapAnything actually works — import AND construct the real model —
+# before the pipeline starts, so a broken install fails here with a clear
+# message instead of deep inside the first chunk's geometric_reconstruction
+# stage. This also front-loads the pretrained-weights download the pipeline
+# needs anyway, so it isn't wasted work.
+print("\\nVerifying MapAnything (import + model init)...")
+try:
+    from mapanything.models import MapAnything as _MapAnythingCheck
+    _mapanything_model_check = _MapAnythingCheck.from_pretrained("facebook/map-anything-apache")
+    del _mapanything_model_check
+    print("  [OK] mapanything imports and facebook/map-anything-apache loads")
+except Exception as e:
+    print(f"  [FAILED] MapAnything verification: {type(e).__name__}: {e}")
+    print("  The pipeline will hit this same error in geometric_reconstruction; fix the install above and Run All again.")
 
-CACHE_SAVE_NOTE_MD = """
-### Publishing a cache dataset (speeds up future runs)
+print(f"\\nInstalls done in {time.time()-_t0:.1f}s. If anything above FAILED, the "
+      f"corresponding pipeline stage will log a fallback rather than crash — "
+      f"check report.json after the run.")
 
-After the first successful run, downloaded wheels and model checkpoints are
-copied into `/kaggle/working/cache/`. To skip re-downloading on future runs:
+# -- 3. detect inputs ---------------------------------------------------------
 
-1. In the Kaggle notebook viewer, open the **Data** pane → **Output**.
-2. Click **New Dataset** from the `cache/` folder, name it (e.g.
-   `sih3d-cache`), and publish it.
-3. Add that dataset as an input to this notebook (**Add Input** → search
-   your username → select it).
-4. On the next run, `find_cache_dir()` will detect it automatically under
-   `/kaggle/input/` and skip downloads it already has.
-"""
-
-DETECT_INPUTS_CELL = '''
-# ============================== INPUT DETECTION =============================
-import importlib
-import sys
-import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path.cwd()))
 import sih3d.io_detect as io_detect
 import sih3d.telemetry as telemetry_mod
 importlib.reload(io_detect)
 importlib.reload(telemetry_mod)
 
-_t0 = time.time()
 detected = io_detect.detect_all(Path(INPUT_ROOT))
-
 if detected.video is None:
     raise RuntimeError(
         f"No video file found under {INPUT_ROOT}. Attach a dataset containing "
         f"a drone video (.mp4/.mov/.mkv/.avi/.m4v/.ts) — see RUN_ON_KAGGLE.md."
     )
 
-print(f"Video: {detected.video.path.name} "
+print(f"\\nVideo: {detected.video.path.name} "
       f"({detected.video.width}x{detected.video.height}, {detected.video.fps:.1f}fps, "
       f"{detected.video.duration_s:.0f}s)")
 print(f"Telemetry: {detected.telemetry_path or '(none found)'} (kind={detected.telemetry_kind})")
@@ -300,8 +272,34 @@ if telemetry is None or len(telemetry) == 0:
           "APPROXIMATE SCALE — NOT GEOREFERENCED. See report.json/viewer.html "
           "for this run's labeling.")
 
-print(f"\\nInput detection done in {time.time()-_t0:.1f}s")
+print(f"\\nSetup done in {time.time()-_t0:.1f}s total.")
 '''
+
+DIRS_CELL = '''
+# %%writefile (used by every cell below this one) does not create parent
+# directories on its own, so create every directory the module-source cells
+# write into, up front, before any of them run.
+from pathlib import Path
+
+for _d in __SIH3D_DIRS__:
+    Path(_d).mkdir(parents=True, exist_ok=True)
+print("sih3d/ package directories ready")
+'''
+
+CACHE_SAVE_NOTE_MD = """
+### Publishing a cache dataset (speeds up future runs)
+
+After the first successful run, downloaded wheels and model checkpoints are
+copied into `/kaggle/working/cache/`. To skip re-downloading on future runs:
+
+1. In the Kaggle notebook viewer, open the **Data** pane → **Output**.
+2. Click **New Dataset** from the `cache/` folder, name it (e.g.
+   `sih3d-cache`), and publish it.
+3. Add that dataset as an input to this notebook (**Add Input** → search
+   your username → select it).
+4. On the next run, `find_cache_dir()` will detect it automatically under
+   `/kaggle/input/` and skip downloads it already has.
+"""
 
 LAUNCH_CELL = '''
 # ============================== LAUNCH =======================================
@@ -440,29 +438,58 @@ print("\\nCopy everything above this line when asking for help.")
 
 RESULTS_CELL = '''
 # ============================== RESULTS ======================================
+# Everything here renders INLINE — nothing needs to be downloaded to check
+# the run. All the underlying files are still saved under /kaggle/working/
+# outputs/ (table + download links at the end of this cell) for later use.
+%matplotlib inline
+import importlib
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd()))
+import sih3d.stage_views as stage_views_mod
+importlib.reload(stage_views_mod)
+from sih3d.stage_views import (
+    render_frame_extraction, render_poses, render_geometric_reconstruction,
+    render_large_scale_alignment, render_dense_point_cloud,
+    render_mesh_textured_model, render_final_summary,
+)
 from IPython.display import display, FileLink, HTML
 
+artifacts = pipeline.artifacts
+
+print("=" * 80); print("KEYFRAMES"); print("=" * 80)
+render_frame_extraction(artifacts)
+
+print("=" * 80); print("CAMERA TRAJECTORY"); print("=" * 80)
+render_poses(artifacts)
+
+print("=" * 80); print("SAMPLE DEPTH / CONFIDENCE MAPS"); print("=" * 80)
+render_geometric_reconstruction(artifacts)
+
+print("=" * 80); print("LARGE-SCALE ALIGNMENT"); print("=" * 80)
+render_large_scale_alignment(artifacts)
+
+print("=" * 80); print("DENSE POINT CLOUD"); print("=" * 80)
+render_dense_point_cloud(artifacts)
+
+print("=" * 80); print("TEXTURED MESH + DSM/ORTHOMOSAIC"); print("=" * 80)
+render_mesh_textured_model(artifacts)
+
+print("=" * 80); print("TIMINGS"); print("=" * 80)
+render_final_summary(report)
+
+print("\\n" + "=" * 80); print("OUTPUT FILES (saved under", OUTPUT_DIR, ")"); print("=" * 80)
 out_dir = Path(OUTPUT_DIR)
-print("Outputs in", out_dir)
 rows = []
 for status in getattr(pipeline, "_export_statuses", []):
     size_mb = (status.size_bytes or 0) / 1e6
     state = "OK" if status.ok else f"SKIPPED ({status.skipped_reason})"
     rows.append(f"<tr><td>{status.name}</td><td>{state}</td><td>{size_mb:.2f} MB</td></tr>")
 display(HTML("<table><tr><th>File</th><th>Status</th><th>Size</th></tr>" + "".join(rows) + "</table>"))
-
 for status in getattr(pipeline, "_export_statuses", []):
     if status.ok and status.path is not None:
         display(FileLink(str(status.path)))
-
-viewer_path = out_dir / "viewer.html"
-if viewer_path.exists():
-    display(HTML(f"<h3>3D Viewer</h3><iframe src='{viewer_path.name}' style='width:100%;height:600px;border:1px solid #30363d'></iframe>"))
-
-report_path = out_dir / "report.html"
-if report_path.exists():
-    display(FileLink(str(report_path)))
 '''
 
 
@@ -478,35 +505,27 @@ def collect_dirs() -> list[str]:
 
 def build() -> None:
     nb = nbf.v4.new_notebook()
-    cells = [md(TITLE_MD), code(CONFIG_CELL), code(ENV_CHECK_CELL)]
+    cells = [md(TITLE_MD), code(CONFIG_CELL)]
 
     dirs = collect_dirs()
     dirs_literal = "[\n    " + ",\n    ".join(f'"{d}"' for d in dirs) + ",\n]"
-    cells.append(code(DIR_SETUP_CELL.format(dirs=dirs_literal)))
+    cells.append(code(DIRS_CELL.replace("__SIH3D_DIRS__", dirs_literal)))
 
-    cells.append(md("## Module source (`sih3d/`) — generated from the actual source files at build time"))
+    cells.append(md("## Module source (`sih3d/`) — generated from the actual source files at build time; collapsed by default, click to expand if you need to inspect it"))
     module_files = sorted(
         (f for f in SIH3D.rglob("*.py") if "__pycache__" not in f.parts),
         key=lambda p: p.relative_to(ROOT).as_posix(),
     )
     for f in module_files:
-        cells.append(writefile_cell(f))
+        cell = writefile_cell(f)
+        cell["metadata"]["jupyter"] = {"source_hidden": True}
+        cells.append(cell)
 
-    cells.append(md("## Install dependencies"))
-    cells.append(code(INSTALL_CELL))
+    cells.append(code(SETUP_CELL))
     cells.append(md(CACHE_SAVE_NOTE_MD))
-
-    cells.append(md("## Detect inputs"))
-    cells.append(code(DETECT_INPUTS_CELL))
-
-    cells.append(md("## Launch"))
     cells.append(code(LAUNCH_CELL))
-
-    cells.append(md("## Debug (run only if the Launch cell above failed or looks wrong)"))
-    cells.append(code(DEBUG_CELL))
-
-    cells.append(md("## Results"))
     cells.append(code(RESULTS_CELL))
+    cells.append(code(DEBUG_CELL))
 
     nb["cells"] = cells
     nb["metadata"] = {
@@ -516,7 +535,8 @@ def build() -> None:
 
     nbf.validate(nb)
     OUT_PATH.write_text(nbf.writes(nb))
-    print(f"Wrote {OUT_PATH} ({len(cells)} cells, {len(module_files)} module files)")
+    driver_cells = len(cells) - len(module_files)
+    print(f"Wrote {OUT_PATH} ({len(cells)} cells total: {len(module_files)} module-source cells [collapsed] + {driver_cells} driver cells)")
 
 
 if __name__ == "__main__":
