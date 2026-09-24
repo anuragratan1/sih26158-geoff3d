@@ -481,3 +481,49 @@ class Dashboard:
         self.results_html.value = (
             f"<table><tr><th>File</th><th>Status</th><th>Size</th></tr>{rows}</table>{viewer_note}"
         )
+
+    def snapshot_html(self) -> str:
+        """A static HTML render of the dashboard's current state, for
+        report.html — ipywidgets themselves don't survive a static export,
+        and Kaggle's "Save Version" runs the notebook headless (no one
+        watching the live widgets), so report.html is the only place the
+        final dashboard state is ever actually seen for that run. Re-uses
+        the same matplotlib panels as the live view, saved as embedded
+        base64 PNGs instead of rendered into an Output widget."""
+        import base64
+        import io as _io
+
+        parts = ["<div style='font-family:sans-serif'>"]
+
+        stage_rows = "".join(
+            f"<tr><td>{c.key}</td><td>{c.status}</td><td>{c.elapsed_s:.1f}s</td>"
+            f"<td>{c.fallback_note or '-'}</td></tr>"
+            for c in self.stage_cards.values()
+        )
+        parts.append(f"<h3>Pipeline stages</h3><table border='1' style='border-collapse:collapse'>"
+                     f"<tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Fallback</th></tr>{stage_rows}</table>")
+
+        try:
+            import matplotlib.pyplot as plt
+
+            if any(len(h) for h in self.gpu_util_history):
+                fig, axes = plt.subplots(1, max(self.gpu_count, 1), figsize=(3 * max(self.gpu_count, 1), 1.5))
+                axes = np.atleast_1d(axes)
+                for i, ax in enumerate(axes):
+                    hist = list(self.gpu_util_history[i]) if i < len(self.gpu_util_history) else []
+                    ax.plot(hist, color="#1f6feb")
+                    ax.set_ylim(0, 100)
+                    ax.set_title(f"GPU{i}", fontsize=8)
+                buf = _io.BytesIO()
+                plt.tight_layout()
+                fig.savefig(buf, format="png", dpi=100)
+                plt.close(fig)
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                parts.append(f"<h3>GPU utilization</h3><img src='data:image/png;base64,{b64}'>")
+        except Exception:
+            pass
+
+        parts.append(f"<h3>Points rendered (final)</h3><p>{len(self.points_xyz):,} points (capped at 150k for the live preview)</p>")
+        parts.append(f"<h3>Log (last {len(self.log_lines)} lines)</h3><pre style='font-size:11px'>" + "\n".join(self.log_lines) + "</pre>")
+        parts.append("</div>")
+        return "".join(parts)
