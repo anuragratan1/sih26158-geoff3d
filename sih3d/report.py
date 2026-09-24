@@ -2,8 +2,8 @@
 
 Deliberately decoupled from EventBus.drain() itself (a queue.Queue can only
 have one destructive consumer) — the orchestration loop drains the bus once
-per tick and fans each event out to both `dashboard.on_event()` and
-`ReportBuilder.on_event()`. This module only accumulates state from events
+per tick and feeds the lightweight progress reporter plus this builder. This
+module only accumulates state from events
 plus a handful of explicit setters for values that aren't naturally
 event-shaped (point/face counts, alignment RMSE, etc.).
 """
@@ -173,7 +173,7 @@ class ReportBuilder:
     def write_json(self, path: Path) -> None:
         path.write_text(json.dumps(self.to_dict(), indent=2, default=str))
 
-    def write_html(self, path: Path, dashboard_snapshot_html: str = "") -> None:
+    def write_html(self, path: Path) -> None:
         d = self.to_dict()
 
         def fmt_s(v):
@@ -229,7 +229,5 @@ h1, h2 {{ font-weight: 600; }}
 <h2>Fallbacks triggered ({len(d['fallbacks_triggered'])})</h2>
 <ul>{fallback_items}</ul>
 {"<h2>GPU Utilization Warnings</h2><ul>" + low_util_html + "</ul>" if low_util_html else ""}
-<h2>Final Dashboard Snapshot</h2>
-{dashboard_snapshot_html}
 </body></html>"""
         path.write_text(html)

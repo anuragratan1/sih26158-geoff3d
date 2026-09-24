@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .events import EventBus
+from .events import EventBus, EventType
 from .fusion import FusedPointCloud, Open3DTsdfFusion
 
 
@@ -69,13 +69,31 @@ def build_vertex_colored_mesh(
         bus.log("Too few fused points for meshing — mesh generation skipped", level="warn")
         return MeshResult(mesh=None, method="none")
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(cloud.points)
     colors01 = np.clip(cloud.colors, 0, 255) / 255.0
-    pcd.colors = o3d.utility.Vector3dVector(colors01)
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
-    pcd.orient_normals_consistent_tangent_plane(30)
-    normals = np.asarray(pcd.normals)
+
+    # orient_normals_consistent_tangent_plane is a minimum-spanning-tree
+    # propagation over the point cloud's KNN graph — real-world observed
+    # cost on a several-hundred-thousand-point cloud: minutes, with zero
+    # progress reporting since it's one opaque native call. That's exactly
+    # the silent multi-minute mesh_textured_model stall seen in practice
+    # (watchdog firing repeatedly with nothing to show), distinct from and
+    # in addition to Poisson/xatlas's own already-bounded steps. Isolated +
+    # timed out the same way as those; on timeout, falls back to plain
+    # per-point estimate_normals with NO consistent orientation — faster
+    # (no MST) and Poisson tolerates locally-inconsistent normals reasonably
+    # well, so meshing still proceeds rather than stalling the whole stage.
+    normals_out = _run_isolated_meshing(
+        _normals_worker, (cloud.points, colors01), bus, "normal estimation",
+        timeout_s=60.0, stage="mesh_textured_model", progress_range=(0.0, 0.15),
+    )
+    if normals_out is not None:
+        normals = normals_out
+    else:
+        bus.log("Falling back to fast normal estimation without consistent orientation", level="warn")
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(cloud.points)
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
+        normals = np.asarray(pcd.normals)
 
     # Open3D's native Poisson/ball-pivoting solvers can hard-abort the whole
     # process on degenerate/pathological point distributions (observed
@@ -85,15 +103,23 @@ def build_vertex_colored_mesh(
     # isolated subprocess so a crash there kills only that subprocess; the
     # pipeline sees it as an ordinary failure and falls back normally.
     method = "poisson"
-    poisson_out = _run_isolated_meshing(_poisson_worker, (cloud.points, colors01, normals, poisson_depth), bus, "Poisson")
+    poisson_out = _run_isolated_meshing(
+        _poisson_worker, (cloud.points, colors01, normals, poisson_depth), bus, "Poisson",
+        stage="mesh_textured_model", progress_range=(0.0, 0.2),
+    )
     if poisson_out is not None:
         vertices, triangles, vcolors = poisson_out
     else:
         bus.log("Poisson reconstruction failed/crashed; trying ball-pivoting as a second fallback", level="warn")
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(cloud.points)
         distances = pcd.compute_nearest_neighbor_distance()
         avg_dist = float(np.mean(distances)) if len(distances) else 0.05
         radii = [avg_dist * r for r in (1.5, 2.0, 3.0)]
-        bp_out = _run_isolated_meshing(_ball_pivot_worker, (cloud.points, colors01, normals, radii), bus, "ball-pivoting")
+        bp_out = _run_isolated_meshing(
+            _ball_pivot_worker, (cloud.points, colors01, normals, radii), bus, "ball-pivoting",
+            stage="mesh_textured_model", progress_range=(0.0, 0.2),
+        )
         if bp_out is not None:
             vertices, triangles, vcolors = bp_out
             method = "ball_pivoting"
@@ -123,6 +149,20 @@ def build_vertex_colored_mesh(
     mesh.compute_vertex_normals()
     bus.log(f"Mesh: built via {method} from point cloud ({len(mesh.vertices)} vertices, {len(mesh.triangles)} faces)")
     return MeshResult(mesh=mesh, method=method, n_vertices=len(mesh.vertices), n_faces=len(mesh.triangles))
+
+
+def _normals_worker(points, colors01, result_queue) -> None:
+    try:
+        import open3d as _o3d
+
+        pcd = _o3d.geometry.PointCloud()
+        pcd.points = _o3d.utility.Vector3dVector(points)
+        pcd.colors = _o3d.utility.Vector3dVector(colors01)
+        pcd.estimate_normals(search_param=_o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
+        pcd.orient_normals_consistent_tangent_plane(30)
+        result_queue.put(np.asarray(pcd.normals))
+    except Exception as e:
+        result_queue.put(e)
 
 
 def _poisson_worker(points, colors, normals, depth, result_queue) -> None:
@@ -205,7 +245,10 @@ def _delaunay_2p5d_worker(points, colors, result_queue) -> None:
         result_queue.put(RuntimeError(f"{type(e).__name__}: {e}"))
 
 
-def _run_isolated_meshing(worker_fn, args: tuple, bus: EventBus, label: str, timeout_s: float = 45.0):
+def _run_isolated_meshing(
+    worker_fn, args: tuple, bus: EventBus, label: str, timeout_s: float = 45.0,
+    stage: str | None = None, progress_range: tuple[float, float] = (0.0, 1.0),
+):
     """Runs `worker_fn(*args, result_queue)` in a subprocess. Returns
     (vertices, triangles, colors) on success, None on any failure —
     including a native crash (nonzero/None exit code) or a timeout, both
@@ -221,6 +264,13 @@ def _run_isolated_meshing(worker_fn, args: tuple, bus: EventBus, label: str, tim
     ever reaching put() — but ball-pivoting and even a plain scipy Delaunay
     call (independently confirmed to run in ~0.2s standalone) both hung
     until forcibly killed, because their results *did* reach put().
+
+    The worker itself has no way to report partial progress (it's one
+    opaque call into Open3D/scipy/xatlas), so while `stage` is given this
+    emits a time-based heartbeat (elapsed/timeout mapped into
+    `progress_range`) every ~2s instead of leaving the stage bar frozen at
+    its starting value for the whole timeout window with no way to tell a
+    slow-but-working run from a genuinely stuck one.
     """
     import multiprocessing as mp
 
@@ -234,7 +284,10 @@ def _run_isolated_meshing(worker_fn, args: tuple, bus: EventBus, label: str, tim
     proc = ctx.Process(target=worker_fn, args=(*args, result_queue))
     proc.start()
 
-    deadline = time.time() + timeout_s
+    start = time.time()
+    deadline = start + timeout_s
+    range_lo, range_hi = progress_range
+    last_heartbeat = 0.0
     result = _SENTINEL_NO_RESULT = object()
     while time.time() < deadline:
         try:
@@ -244,6 +297,15 @@ def _run_isolated_meshing(worker_fn, args: tuple, bus: EventBus, label: str, tim
             pass
         if not proc.is_alive():
             break
+        now = time.time()
+        if stage is not None and now - last_heartbeat >= 2.0:
+            elapsed = now - start
+            frac = range_lo + (range_hi - range_lo) * min(0.95, elapsed / timeout_s)
+            bus.publish(
+                EventType.STAGE_PROGRESS, stage=stage, frac=frac,
+                rate_label=f"{label}: {elapsed:.0f}s (working, not stuck — times out at {timeout_s:.0f}s)",
+            )
+            last_heartbeat = now
 
     if result is _SENTINEL_NO_RESULT:
         try:
@@ -266,6 +328,36 @@ def _run_isolated_meshing(worker_fn, args: tuple, bus: EventBus, label: str, tim
     else:
         bus.log(f"{label} timed out after {timeout_s:.0f}s — treating as failed", level="warn")
     return None
+
+
+def _xatlas_worker(vertices, faces, result_queue) -> None:
+    try:
+        import xatlas
+
+        vmapping, indices, uvs = xatlas.parametrize(vertices, faces)
+        result_queue.put((vmapping, indices, uvs))
+    except Exception as e:
+        result_queue.put(e)
+
+
+def _run_isolated_xatlas(
+    vertices, faces, bus: EventBus, timeout_s: float = 45.0,
+    stage: str | None = None, progress_range: tuple[float, float] = (0.0, 1.0),
+):
+    """xatlas.parametrize has no timeout or progress callback of its own
+    and can run for minutes on a mesh with many/poorly-parameterizable
+    faces — a real stall observed in practice as mesh_textured_model
+    sitting at 0% with no watchdog-visible progress for the entire
+    duration, since the per-face time-budget check further down in
+    bake_texture() never gets a chance to run until UV unwrapping is
+    already done. Delegates to _run_isolated_meshing's subprocess+timeout+
+    heartbeat machinery — the shape (isolate a single opaque blocking call,
+    time-box it, heartbeat while waiting) is identical, only the worker and
+    return payload differ."""
+    return _run_isolated_meshing(
+        _xatlas_worker, (vertices, faces), bus, "xatlas UV-unwrap", timeout_s=timeout_s,
+        stage=stage, progress_range=progress_range,
+    )
 
 
 @dataclass
@@ -293,7 +385,7 @@ def bake_texture(
 ) -> TextureBakeResult:
     t0 = time.time()
     try:
-        import xatlas
+        import xatlas  # noqa: F401 — availability check; actual call is isolated below
     except Exception as e:
         return TextureBakeResult(textured=False, skipped_reason=f"xatlas not installed ({e})")
 
@@ -314,8 +406,14 @@ def bake_texture(
         mesh.compute_triangle_normals()
         normals = np.asarray(mesh.triangle_normals)
 
-    bus.log(f"Texture baking: UV-unwrapping {len(faces)} faces via xatlas...")
-    vmapping, indices, uvs = xatlas.parametrize(vertices, faces)
+    bus.log(f"Texture baking: UV-unwrapping {len(faces)} faces via xatlas (bounded to 45s)...")
+    unwrap = _run_isolated_xatlas(
+        vertices, faces, bus, timeout_s=45.0,
+        stage="mesh_textured_model", progress_range=(0.4, 0.7),
+    )
+    if unwrap is None:
+        return TextureBakeResult(textured=False, skipped_reason="xatlas UV-unwrap failed or timed out")
+    vmapping, indices, uvs = unwrap
     # xatlas may duplicate/reorder vertices at UV seams; `vmapping` maps each
     # new (post-unwrap) vertex back to its original vertex index.
     unwrapped_positions = vertices[vmapping]

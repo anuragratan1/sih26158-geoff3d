@@ -69,7 +69,7 @@ from .events import Event, EventBus, EventType
 from .fusion import FusedPointCloud, VoxelPointFusion, remove_statistical_outliers
 from .gpu_monitor import GpuMonitor
 from .io_detect import DetectedInputs
-from .keyframes import compute_sharpness, select_keyframes
+from .keyframes import select_keyframes
 from .mesh import KeyframeForBaking
 from .report import ReportBuilder
 from .telemetry import (
@@ -86,7 +86,21 @@ class PipelineConfig:
     chunk_size: int = 30
     chunk_overlap: int = 6
     quick_seconds: float = 90.0
-    quick_max_keyframes: int = 120
+    # Kept under chunk_size (30): _make_chunks emits exactly one chunk when
+    # len(keyframes) <= chunk_size, which skips large_scale_alignment's
+    # cross-chunk blending entirely and runs the backbone exactly once.
+    # That's the single biggest lever on QUICK-mode wall time, well above
+    # what tuning decode speed alone can buy back.
+    quick_max_keyframes: int = 28
+    # FULL mode's own keyframe budget — chunk_size(30)/overlap(6) chunking
+    # is otherwise unbounded for a long video: whatever fraction of decoded
+    # candidates clears the sharpness floor becomes the keyframe count with
+    # no ceiling, so wall time (chunk count x backbone pass) and raw-frame
+    # host RAM during decode both scale with video length with no cap. 240
+    # keyframes is ~8 chunks with DUAL_GPU splitting them across both T4s —
+    # sized for the documented "<15 min for a 10-min video" FULL-mode target
+    # (see CONFIG_CELL in build_notebook.py).
+    full_max_keyframes: int = 240
     backbone_input_size: int = 518
     output_dir: Path = Path("/kaggle/working/outputs")
     device0: str = "cuda:0"
@@ -577,17 +591,12 @@ class Pipeline:
             raw_indices.append(idx)
             raw_ts.append(t)
             raw_frames.append(frame)
-            # A real per-frame score, not a placeholder — the frames panel
-            # used to always show "sharpness=0" here because the actual
-            # accept/reject scoring happens afterward in one GPU batch over
-            # ALL collected frames (select_keyframes below), not per frame
-            # as each is decoded. This single-frame call is cheap (frames
-            # are already scale_width-limited) and purely for the live
-            # display; select_keyframes' batch scores are still what
-            # decides acceptance.
-            live_sharpness = compute_sharpness(frame, device=cfg.device0 if "cuda" in cfg.device0 else "cpu")
-            self._emit(EventType.FRAME_DECODED, frame=frame, frame_index=idx, sharpness=live_sharpness)
-            if cfg.mode == "QUICK" and len(raw_frames) >= cfg.quick_max_keyframes * 4:
+            # There is intentionally no per-frame UI event here.  Passing a
+            # 1920px ndarray through a dashboard queue and PNG encoder can
+            # monopolize Kaggle's vCPUs.  The authoritative sharpness pass
+            # below processes all candidates efficiently in GPU batches.
+            max_keyframes = cfg.quick_max_keyframes if cfg.mode == "QUICK" else cfg.full_max_keyframes
+            if len(raw_frames) >= max_keyframes * 4:
                 break  # decode a bounded multiple of the target count; selection will thin it out
 
         if not raw_frames:
@@ -628,9 +637,10 @@ class Pipeline:
             ))
 
         accepted = selection.accepted
-        if cfg.mode == "QUICK" and len(accepted) > cfg.quick_max_keyframes:
-            step = len(accepted) / cfg.quick_max_keyframes
-            accepted = [accepted[int(i * step)] for i in range(cfg.quick_max_keyframes)]
+        max_keyframes = cfg.quick_max_keyframes if cfg.mode == "QUICK" else cfg.full_max_keyframes
+        if len(accepted) > max_keyframes:
+            step = len(accepted) / max_keyframes
+            accepted = [accepted[int(i * step)] for i in range(max_keyframes)]
 
         prepared = []
         for cand in accepted:

@@ -16,6 +16,34 @@ from __future__ import annotations
 import numpy as np
 
 from .artifacts import RunArtifacts
+
+
+def _geotiff_to_png(path: str, max_dim: int = 1600) -> bytes:
+    """Read a GeoTIFF into a bounded PNG for the final static results cell."""
+    import io
+    from PIL import Image
+    import rasterio
+
+    with rasterio.open(path) as src:
+        data = src.read()
+    if data.shape[0] >= 3:
+        arr = np.transpose(data[:3], (1, 2, 0)).astype(np.float32)
+    else:
+        band = data[0].astype(np.float32)
+        arr = np.stack([band, band, band], axis=-1)
+    finite = np.isfinite(arr)
+    if finite.any():
+        lo, hi = np.percentile(arr[finite], [2, 98])
+        arr = np.clip((arr - lo) / max(hi - lo, 1e-6), 0, 1)
+    else:
+        arr = np.zeros_like(arr)
+    image = Image.fromarray((np.nan_to_num(arr) * 255).astype(np.uint8))
+    if max(image.size) > max_dim:
+        scale = max_dim / max(image.size)
+        image = image.resize((int(image.width * scale), int(image.height * scale)))
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
 from .report import ReportBuilder
 
 
@@ -197,7 +225,6 @@ def render_dense_point_cloud(artifacts: RunArtifacts) -> None:
     coverage_path = artifacts.output_paths.get("coverage.tif")
     if coverage_path:
         try:
-            from .dashboard import _geotiff_to_png
             from PIL import Image
             import io
 
@@ -241,7 +268,6 @@ def render_mesh_textured_model(artifacts: RunArtifacts) -> None:
             print(f"{title}: not yet written.")
             continue
         try:
-            from .dashboard import _geotiff_to_png
             from PIL import Image
             import io
 

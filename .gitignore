@@ -6,3 +6,8 @@ cache/
 .DS_Store
 
 .env*
+
+# Downloaded run outputs and one-off scratch files, not source
+graphify-out/
+viewer*.html
+kaggle_patch_cell.py

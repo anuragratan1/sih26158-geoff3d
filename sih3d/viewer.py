@@ -130,10 +130,21 @@ _TEMPLATE = """<!DOCTYPE html>
   <div id="measure-readout"></div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r158/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/controls/OrbitControls.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/loaders/GLTFLoader.js"></script>
-<script>
+<script type="module">
+// three.js dropped its legacy non-module examples/js/ UMD builds for
+// OrbitControls/GLTFLoader some releases back (they 404 on cdnjs/jsdelivr
+// now) — only the ES-module examples/jsm/ versions still exist. Loading
+// the old paths left THREE.OrbitControls undefined, which threw and
+// silently killed the rest of this script before the point cloud was ever
+// added to the scene: the HUD panel (plain HTML/CSS) still rendered, but
+// the canvas stayed black. type="module" + these imports both fixes that
+// and still works from a file:// URL — the restriction on importing local
+// files as modules from file:// doesn't apply to importing a remote
+// https:// module.
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js";
+import {{ OrbitControls }} from "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/controls/OrbitControls.js";
+import {{ GLTFLoader }} from "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/loaders/GLTFLoader.js";
+
 const POINTS_B64 = "{points_b64}";
 const COLORS_B64 = "{colors_b64}";
 const CONF_B64 = "{conf_b64}";
@@ -162,7 +173,7 @@ dirLight.position.set(1, 2, 1);
 scene.add(dirLight);
 scene.add(new THREE.AxesHelper(5));
 
-const controls = new THREE.OrbitControls(camera, renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
 // -- point cloud --------------------------------------------------------
@@ -208,7 +219,7 @@ document.getElementById("color-mode").addEventListener("change", (e) => {{
 // -- mesh ------------------------------------------------------------------
 let meshObject = null;
 if (MESH_B64) {{
-  const loader = new THREE.GLTFLoader();
+  const loader = new GLTFLoader();
   loader.parse(b64ToArrayBuffer(MESH_B64), "", (gltf) => {{
     meshObject = gltf.scene;
     scene.add(meshObject);

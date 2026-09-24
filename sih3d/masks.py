@@ -55,7 +55,19 @@ class DynamicObjectMasker:
             return
         self._load_attempted = True
         try:
+            import logging
+
             from ultralytics import YOLO
+            from ultralytics.utils import LOGGER as _ultralytics_logger
+
+            # Ultralytics logs a "'half' is deprecated" warning through its
+            # own LOGGER on every single predict() call (once per frame,
+            # not once per process) — with masking running per-frame across
+            # every chunk, that's hundreds of identical lines flooding the
+            # notebook and making a live, progressing run look frozen. This
+            # is purely the deprecation notice, not an error; ERROR level
+            # still surfaces anything that actually matters.
+            _ultralytics_logger.setLevel(logging.ERROR)
 
             t0 = time.time()
             self.model = YOLO(self.model_name)
