@@ -171,10 +171,31 @@ if not _gpu_ok:
 
 from sih3d.io_detect import find_cache_dir  # noqa: E402
 
+# Everything that downloads anything slow — pip wheels, HuggingFace weights
+# (MapAnything), torch.hub weights (dinov2 backbone), ultralytics checkpoints
+# — is pointed at CACHE_DIR (attached read-only input dataset if one exists
+# from a previous run's publish, else the writable working dir this run
+# will populate). Setting these env vars BEFORE any package that reads them
+# is imported is required — huggingface_hub/torch both read HF_HOME/
+# TORCH_HOME once at import time, not per-download. Without this, the
+# previous "publish /kaggle/working/cache/ as a dataset" instructions
+# published an empty folder: nothing was ever writing into it.
+import os
+
 _cache_ds = find_cache_dir(Path(INPUT_ROOT))
+_cache_root = Path(_cache_ds) if _cache_ds is not None else Path(CACHE_DIR)
+_cache_root.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(_cache_root / "huggingface"))
+os.environ.setdefault("TORCH_HOME", str(_cache_root / "torch"))
+os.environ.setdefault("PIP_CACHE_DIR", str(_cache_root / "pip"))
+os.environ.setdefault("YOLO_CONFIG_DIR", str(_cache_root / "ultralytics"))
 _pip_extra = ["--find-links", str(_cache_ds)] if _cache_ds is not None else []
 if _cache_ds is not None:
-    print(f"\\nFound a cache dataset at {_cache_ds} — pip will prefer any wheels there and skip re-downloading.")
+    print(f"\\nFound a cache dataset at {_cache_ds} — HF/torch/pip/YOLO caches point at it directly, nothing should re-download.")
+else:
+    print(f"\\nNo cache dataset attached — this run's downloads will land under {CACHE_DIR}. "
+          f"Publish that folder as a Kaggle dataset after this run finishes and attach it as an "
+          f"input next time to skip re-downloading (see the note below the Setup cell).")
 
 def _try_import(module_name: str) -> bool:
     try:
@@ -334,18 +355,23 @@ print(f"\\nSetup done in {time.time()-_t0:.1f}s total.")
 '''
 
 CACHE_SAVE_NOTE_MD = """
-### Publishing a cache dataset (speeds up future runs)
+### Publishing a cache dataset (speeds up future runs — do this once)
 
-After the first successful run, downloaded wheels and model checkpoints are
-copied into `/kaggle/working/cache/`. To skip re-downloading on future runs:
+The Setup cell points `HF_HOME`/`TORCH_HOME`/`PIP_CACHE_DIR`/`YOLO_CONFIG_DIR`
+at `/kaggle/working/cache/` for this run, so everything slow — pip wheels,
+MapAnything weights (HuggingFace), the dinov2 backbone (torch.hub),
+the YOLO-seg checkpoint (ultralytics) — lands there instead of scattered
+default cache locations. After your first successful run:
 
 1. In the Kaggle notebook viewer, open the **Data** pane → **Output**.
 2. Click **New Dataset** from the `cache/` folder, name it (e.g.
    `sih3d-cache`), and publish it.
 3. Add that dataset as an input to this notebook (**Add Input** → search
-   your username → select it).
-4. On the next run, `find_cache_dir()` will detect it automatically under
-   `/kaggle/input/` and skip downloads it already has.
+   your username → select it) — it stays attached across future Run Alls
+   of this notebook, no need to redo this step per run.
+4. On every future run, the Setup cell's `find_cache_dir()` detects it
+   under `/kaggle/input/` and points those same env vars directly at it —
+   zero downloads, install phase should drop from minutes to seconds.
 """
 
 LAUNCH_CELL = '''
