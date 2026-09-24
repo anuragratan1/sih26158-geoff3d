@@ -846,6 +846,7 @@ class Pipeline:
 
     def _align_chunk(self, chunk_kfs: list[PreparedKeyframe], result: ChunkResult, chunk_idx: int) -> None:
         cam_local = result.camera_poses_est[:, :3, 3]
+        cam_local_R = result.camera_poses_est[:, :3, :3]
 
         if self.georeferenced:
             gps_pts = np.array([kf.gps_enu if kf.gps_enu is not None else [np.nan] * 3 for kf in chunk_kfs])
@@ -884,6 +885,15 @@ class Pipeline:
         world_cam = alignment.apply(cam_local)
         for i, (kf, wc) in enumerate(zip(chunk_kfs, world_cam)):
             kf._resolved_world_pose = wc  # noqa: SLF001 — internal bookkeeping between pipeline stages
+            # Rotation composes under a similarity transform independent of
+            # scale/translation: alignment.apply(p) = scale*(R@p)+t, so a
+            # vector/orientation transforms as R_world = alignment.R @
+            # R_local. This used to be dropped entirely (_resolved_pose
+            # returned identity rotation always), which meant texture
+            # baking's "most fronto-parallel view" scoring and any
+            # reprojection-based comparison were both working with a camera
+            # that was never actually pointed the way it was really pointed.
+            kf._resolved_world_rotation = alignment.R @ cam_local_R[i]  # noqa: SLF001
             self._emit(EventType.TRAJECTORY_POINT, kind="camera", x=wc[0], y=wc[1])
             self.artifacts.camera_track_enu.append(tuple(wc))
             if self.georeferenced and kf.gps_enu is not None:
@@ -918,7 +928,10 @@ class Pipeline:
 
     def _resolved_pose(self, kf: PreparedKeyframe, chunk_idx) -> np.ndarray:
         wc = getattr(kf, "_resolved_world_pose", None)
+        wr = getattr(kf, "_resolved_world_rotation", None)
         pose = np.eye(4)
+        if wr is not None:
+            pose[:3, :3] = wr
         if wc is not None:
             pose[:3, 3] = wc
         return pose
