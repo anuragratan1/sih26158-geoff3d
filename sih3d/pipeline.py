@@ -477,8 +477,9 @@ class Pipeline:
                     break
                 chunk_result = self._process_chunk(bb, prior_mode, chunk_kfs, chunk_idx)
                 frac = (chunk_idx + 1) / len(chunks)
-                self._emit(EventType.STAGE_PROGRESS, stage="geometric_reconstruction", frac=frac)
-                self._emit(EventType.STAGE_PROGRESS, stage="large_scale_alignment", frac=frac)
+                rate_label = self._chunk_rate_label(chunk_idx + 1, len(chunks), geom_stage_t0)
+                self._emit(EventType.STAGE_PROGRESS, stage="geometric_reconstruction", frac=frac, rate_label=rate_label)
+                self._emit(EventType.STAGE_PROGRESS, stage="large_scale_alignment", frac=frac, rate_label=rate_label)
 
                 if chunk_result is None:
                     continue
@@ -490,7 +491,7 @@ class Pipeline:
                         self._fallback("dense_point_cloud", RuntimeError("GPU1 worker queue full/stalled; dropping chunk"))
                 else:
                     self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, chunk_result)
-                    self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac)
+                    self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac, rate_label=rate_label)
 
             if self.two_gpu:
                 self._chunk_queue.put(self._SENTINEL)
@@ -785,6 +786,16 @@ class Pipeline:
         self._finish_chunk_alignment(chunk_kfs, result, chunk_idx)
         return result
 
+    def _chunk_rate_label(self, done: int, total: int, stage_t0: float) -> str:
+        """Shared by the single-GPU chunk loop and the DUAL_GPU stitcher —
+        throughput + ETA for the dashboard's per-stage rate label, same
+        purpose as decode.py's fps line: tell a slow-but-working stage
+        apart from a genuinely stalled one at a glance."""
+        elapsed = time.time() - stage_t0
+        rate_per_min = (done / elapsed) * 60.0 if elapsed > 0 else 0.0
+        eta = f", ETA {(total - done) * (elapsed / done):.0f}s" if done > 0 and done < total else ""
+        return f"{done}/{total} chunks, {rate_per_min:.1f}/min{eta}"
+
     def _scale_intrinsics(self, K: np.ndarray, orig_shape: tuple, target_size: int) -> np.ndarray:
         h, w = orig_shape[:2]
         sx, sy = target_size / w, target_size / h
@@ -993,6 +1004,7 @@ class Pipeline:
         """
         cfg = self.config
         n = len(chunks)
+        stage_t0 = time.time()
         q0: "queue.Queue" = queue.Queue(maxsize=3)
         q1: "queue.Queue" = queue.Queue(maxsize=3)
         results: dict[int, tuple[list[PreparedKeyframe], ChunkResult | None]] = {}
@@ -1046,8 +1058,9 @@ class Pipeline:
                 chunk_kfs, result = results.pop(chunk_idx)
 
             frac = (chunk_idx + 1) / n
-            self._emit(EventType.STAGE_PROGRESS, stage="geometric_reconstruction", frac=frac)
-            self._emit(EventType.STAGE_PROGRESS, stage="large_scale_alignment", frac=frac)
+            rate_label = self._chunk_rate_label(chunk_idx + 1, n, stage_t0)
+            self._emit(EventType.STAGE_PROGRESS, stage="geometric_reconstruction", frac=frac, rate_label=rate_label)
+            self._emit(EventType.STAGE_PROGRESS, stage="large_scale_alignment", frac=frac, rate_label=rate_label)
 
             if result is None:
                 continue
@@ -1059,7 +1072,7 @@ class Pipeline:
             # across both GPUs instead of bottlenecking on one.
             masker = self.masker0 if (chunk_idx % 2 == 0) else self.masker
             self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, result, masker=masker)
-            self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac)
+            self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac, rate_label=rate_label)
 
         dispatch_thread.join(timeout=60)
         worker0_thread.join(timeout=300)

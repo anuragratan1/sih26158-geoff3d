@@ -30,6 +30,7 @@ just falls through to the next backend rather than crashing.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -267,9 +268,10 @@ class FrameDecoder:
         else:
             yield from self._iter_ffmpeg(start_s, end_s, stride, hwaccel=False, target_fps=target_fps, scale_width=scale_width)
 
-    def _with_progress_logging(self, gen, start_s, end_s, target_fps, log_every_s: float = 5.0):
+    def _with_progress_logging(self, gen, start_s, end_s, target_fps, log_every_s: float = 5.0, ui_every_s: float = 1.0):
         t0 = time.time()
         last_log = t0
+        last_ui = t0
         count = 0
         est_total = None
         if end_s is not None and target_fps:
@@ -277,13 +279,27 @@ class FrameDecoder:
         for item in gen:
             count += 1
             now = time.time()
+            elapsed = now - t0
+            fps = count / elapsed if elapsed > 0 else 0.0
             if now - last_log >= log_every_s:
-                elapsed = now - t0
-                fps = count / elapsed if elapsed > 0 else 0.0
                 eta = f", ETA {(est_total - count) / fps:.0f}s" if (est_total and fps > 0 and count < est_total) else ""
                 total_note = f"/{est_total}" if est_total else ""
                 self.bus.log(f"Decode progress: {count}{total_note} frames, {fps:.1f} fps{eta}")
                 last_log = now
+            if now - last_ui >= ui_every_s:
+                # A tighter cadence than the log line above, specifically
+                # so the frame_extraction progress bar/rate label visibly
+                # moves — the thing actually being watched to tell "is
+                # this frozen or just slow" (see decode.py's module
+                # docstring for the run where the absence of exactly this
+                # signal made a real stall indistinguishable from normal
+                # progress until it had already been stuck for minutes).
+                self.bus.publish(
+                    EventType.STAGE_PROGRESS, stage="frame_extraction",
+                    frac=(count / est_total) if est_total else None,
+                    rate_label=f"{fps:.1f} fps" + (f" ({count}/{est_total})" if est_total else f" ({count} frames)"),
+                )
+                last_ui = now
             yield item
 
     def _iter_torchcodec(self, start_s, end_s, stride, target_fps):
@@ -392,6 +408,33 @@ class FrameDecoder:
         frame_bytes = out_w * out_h * 3
         idx = int(start_s * native_fps)
         idx_step = max(1, round(native_fps / target_fps)) if target_fps else stride
+
+        # Drain stderr continuously in a background thread. This is not
+        # optional: a real run froze hard mid-decode (hundreds of frames
+        # in fine, then a sudden total stall, GPU going idle) with no
+        # exception, no timeout, nothing in the logs — a classic Python
+        # subprocess deadlock. stdout and stderr are separate OS pipes
+        # with a limited buffer each (commonly 64KB on Linux); this loop
+        # only ever read stdout, so once ffmpeg had written enough to
+        # stderr (container/timestamp warnings etc. — `-v error` reduces
+        # but doesn't guarantee zero) to fill that pipe, ffmpeg's own
+        # write() to stderr blocked, which blocks ffmpeg entirely,
+        # including producing any more stdout — so our stdout.read() here
+        # then blocks forever waiting for frames that will never come.
+        # Draining stderr on its own thread the whole time removes the
+        # only way that pipe could ever fill.
+        stderr_chunks: list[bytes] = []
+
+        def _drain_stderr() -> None:
+            try:
+                for chunk in iter(lambda: proc.stderr.read(4096), b""):
+                    stderr_chunks.append(chunk)
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True, name="sih3d-ffmpeg-stderr")
+        stderr_thread.start()
+
         try:
             while True:
                 buf = proc.stdout.read(frame_bytes)
@@ -403,8 +446,9 @@ class FrameDecoder:
         finally:
             proc.stdout.close()
             proc.wait(timeout=10)
+            stderr_thread.join(timeout=5)
             if proc.returncode not in (0, None) and proc.returncode != 0:
-                err = proc.stderr.read().decode("utf-8", "ignore")[-2000:]
+                err = b"".join(stderr_chunks).decode("utf-8", "ignore")[-2000:]
                 if hwaccel and allow_fallback:
                     self.bus.log(f"ffmpeg CUDA decode failed ({err.strip()[-300:]}); retrying with CPU decode", level="warn")
                     yield from self._iter_ffmpeg(start_s, end_s, stride, hwaccel=False, target_fps=target_fps, scale_width=scale_width)
