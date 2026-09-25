@@ -295,13 +295,19 @@ def _poisson_worker(points, colors, normals, depth, result_queue) -> None:
         # was an overcorrection, confirmed by a real run: it punched holes
         # through large areas of otherwise-good surface ("swiss cheese"),
         # not just the outer fringe, because 12% of ANY real mesh's
-        # vertices are locally-sparser-but-real, not hallucinated. Back
-        # down to 2% (close to Open3D's own reference-tutorial value) —
-        # the connected-component pass below is the actual right tool for
-        # spike/hair artifacts specifically (removes genuinely isolated
-        # small fragments, not a density percentile blind to whether a
-        # vertex is isolated debris or part of the main surface).
-        keep = densities >= _np.quantile(densities, 0.02)
+        # vertices are locally-sparser-but-real, not hallucinated. Down to
+        # 1% (Open3D's own reference-tutorial value) now that the actual
+        # sources of those spikes are handled elsewhere: water/sky are
+        # masked out before fusion (masks.py's SemanticMasker) and normals
+        # are camera-oriented rather than MST-derived (fewer flipped-
+        # normal artifacts for Poisson to hallucinate around in the first
+        # place) — this trim only needs to catch the ordinary fringe now,
+        # not compensate for noisy input. The connected-component pass
+        # below remains the right tool for any isolated spike/hair
+        # fragments specifically (removes genuinely isolated small
+        # fragments, not a density percentile blind to whether a vertex
+        # is isolated debris or part of the main surface).
+        keep = densities >= _np.quantile(densities, 0.01)
         mesh.remove_vertices_by_mask(~keep)
         mesh.remove_degenerate_triangles()
         mesh.remove_unreferenced_vertices()
