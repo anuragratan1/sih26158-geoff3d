@@ -65,7 +65,7 @@ from . import mesh as mesh_mod
 from .artifacts import ChunkAlignmentRecord, ChunkGeometrySample, KeyframeRecord, RunArtifacts
 from .backbone import ChunkResult, PriorMode, ViewInput
 from .decode import FrameDecoder
-from .events import Event, EventBus, EventType
+from .events import EventBus, EventType
 from .fusion import FusedPointCloud, Open3DTsdfFusion, VoxelPointFusion, remove_statistical_outliers
 from .gpu_monitor import GpuMonitor
 from .io_detect import DetectedInputs
@@ -333,13 +333,21 @@ class Pipeline:
             )
 
     def _emit(self, event_type: EventType, **payload) -> None:
-        """Publishes to the bus (for the dashboard/any external consumer)
-        AND feeds ReportBuilder directly and synchronously. report-building
-        is cheap bookkeeping, not rendering, so there's no reason report.json
-        should depend on an external consumer having drained the bus in
-        time — that's exactly the race this fixes (caught by the local dry
-        run: report.json showed every stage as "pending" because nothing
-        was draining the bus into `report` at all yet)."""
+        """Publishes to the bus only — NOT a direct feed into ReportBuilder
+        (an earlier version of this docstring described a direct feed here;
+        that created a double-counting bug once the Launch cell's drain
+        loop ALSO started forwarding bus events into `report`, since
+        anything logged directly via `bus.log(...)` from outside
+        pipeline.py — mesh.py, fusion.py, masks.py, align.py,
+        validation.py — was never reaching `report` any other way, making
+        report.json's fallbacks/warnings silently blind to most of the
+        pipeline's own warnings). The bus-drain loop is now the single,
+        sole path from any event (pipeline's own or a library module's) to
+        `report`, so nothing is fed twice regardless of where it was
+        published from. This does mean report-building depends on the
+        Launch cell continuing to drain the bus — it does so continuously
+        while the pipeline runs, plus once more after it exits, before
+        report.json/html are written, so no window is missed in practice."""
         ts = time.time()
         self._last_progress_ts = ts
         if event_type == EventType.STAGE_START:
@@ -347,12 +355,10 @@ class Pipeline:
         elif event_type in (EventType.STAGE_DONE, EventType.STAGE_ERROR):
             self._current_stage = None
         self.bus.publish(event_type, **payload)
-        self.report.on_event(Event(type=event_type, payload=payload, ts=ts))
 
     def _log(self, message: str, level: str = "info") -> None:
         self._last_progress_ts = time.time()
         self.bus.log(message, level=level)
-        self.report.on_event(Event(type=EventType.LOG, payload={"message": message, "level": level}, ts=time.time()))
 
     def _watchdog_loop(self) -> None:
         """Polls for silent stalls (see class docstring / decode.py's own

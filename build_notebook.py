@@ -530,29 +530,32 @@ print(f"Video: {detected.video.path.name} | {detected.video.width}x{detected.vid
       f"{detected.video.fps:.1f} fps | mode={MODE} | GPUs={gpu_monitor.device_names}")
 pipeline.start()
 
-# Every OTHER pipeline event already feeds `report` synchronously via the
-# pipeline's own _emit/_log (see pipeline.py) — forwarding them again here
-# would double-count things like keyframe_count and duplicate warnings.
-# GPU_SAMPLE/CPU_SAMPLE are the one exception: GpuMonitor's own background
-# thread calls bus.publish(...) directly and has no reference to `report`,
-# so this drain loop is the only place left that ever sees them. Without
-# forwarding just these two, report.json/report.html's
-# avg_gpu_util_pct/avg_cpu_util_pct columns stay empty for every stage
-# even though sampling itself is working fine.
-_REPORT_FORWARD_TYPES = (events_mod.EventType.GPU_SAMPLE, events_mod.EventType.CPU_SAMPLE)
+# This drain loop is the SOLE path from any bus event to `report` (see
+# pipeline.py's _emit/_log docstrings) — pipeline.py itself only
+# publishes to the bus now, it no longer feeds `report` directly. That
+# used to be split: pipeline.py fed its own STAGE_*/KEYFRAME_*/LOG
+# events into `report` directly and synchronously, while this loop only
+# forwarded GPU_SAMPLE/CPU_SAMPLE (GpuMonitor's own thread has no
+# `report` reference to call directly). The gap: anything logged via a
+# bare `bus.log(...)` from OUTSIDE pipeline.py — mesh.py, fusion.py,
+# masks.py, align.py, validation.py all do this — was never reaching
+# `report` either way, so report.json's fallbacks/warnings lists were
+# silently blind to most of the pipeline's own real warnings (e.g. "TSDF
+# available but produced an empty mesh" never once showed up, no matter
+# how many runs actually hit it). Forwarding everything here, from one
+# place, fixes that without reopening the double-counting risk a second
+# direct feed would create.
 while pipeline.is_alive():
     for evt in bus.drain():
         progress.on_event(evt)
-        if evt.type in _REPORT_FORWARD_TYPES:
-            report.on_event(evt)
+        report.on_event(evt)
     time.sleep(0.1)
 
 # Final drain after the pipeline exits, so terminal progress catches final
 # stage completions and warnings.
 for evt in bus.drain():
     progress.on_event(evt)
-    if evt.type in _REPORT_FORWARD_TYPES:
-        report.on_event(evt)
+    report.on_event(evt)
 progress.close()
 
 report.write_json(Path(OUTPUT_DIR) / "report.json")
