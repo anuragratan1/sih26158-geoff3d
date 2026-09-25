@@ -252,6 +252,8 @@ class Pipeline:
         self.fusion_acc = VoxelPointFusion(config.voxel_size_m, device=config.device0)
         self.masker: masks.DynamicObjectMasker | None = None
         self.masker0: masks.DynamicObjectMasker | None = None  # DUAL_GPU only — device0's own masker, alongside self.masker on device1
+        self.semantic_masker: masks.SemanticMasker | None = None
+        self.semantic_masker0: masks.SemanticMasker | None = None  # DUAL_GPU only, mirrors masker0
 
         # DUAL_GPU idle-wait tracking, keyed by device string — logged and
         # surfaced in the final summary so "is a GPU actually busy" has a
@@ -408,8 +410,10 @@ class Pipeline:
 
         if self.two_gpu:
             self.masker = masks.DynamicObjectMasker(self.bus, device=cfg.device1)
+            self.semantic_masker = masks.SemanticMasker(self.bus, device=cfg.device1)
             if cfg.dual_gpu:
                 self.masker0 = masks.DynamicObjectMasker(self.bus, device=cfg.device0)
+                self.semantic_masker0 = masks.SemanticMasker(self.bus, device=cfg.device0)
 
         # -- Stage: frame_extraction -------------------------------------
         # Backbone selection/loading is deliberately NOT done before this
@@ -994,14 +998,22 @@ class Pipeline:
     def _mask_and_fuse_chunk(
         self, chunk_idx: int, chunk_kfs: list[PreparedKeyframe], result: ChunkResult,
         masker: "masks.DynamicObjectMasker | None" = None,
+        semantic_masker: "masks.SemanticMasker | None" = None,
     ) -> None:
-        """`masker` defaults to `self.masker` (the single-GPU/GPU1-worker
-        behavior, unchanged) — DUAL_GPU's stitcher passes `self.masker0`
-        or `self.masker` explicitly per chunk instead, so masking runs on
-        whichever GPU actually produced that chunk's geometry rather than
-        being pinned to one device."""
+        """`masker`/`semantic_masker` default to `self.masker`/
+        `self.semantic_masker` (the single-GPU/GPU1-worker behavior,
+        unchanged) — DUAL_GPU's stitcher passes the *0 variants explicitly
+        per chunk instead, so masking runs on whichever GPU actually
+        produced that chunk's geometry rather than being pinned to one
+        device. Combines both into one `dynamic_mask`: moving objects
+        (masker) and water/sky (semantic_masker) both corrupt multi-view
+        fusion the same way — neither has a stable, view-consistent 3D
+        position — so both get excluded from fusion through the same
+        mechanism, just detected differently."""
         if masker is None:
             masker = self.masker
+        if semantic_masker is None:
+            semantic_masker = self.semantic_masker
         alignment = self.chunk_alignments[chunk_idx] if chunk_idx < len(self.chunk_alignments) else None
         if alignment is None:
             return
@@ -1010,10 +1022,17 @@ class Pipeline:
         colors = np.stack([_resize_for_backbone(kf.image_full, points_world.shape[1]) for kf in chunk_kfs], axis=0)
 
         dynamic_mask = None
-        if masker is not None:
+        if masker is not None or semantic_masker is not None:
             try:
-                masks_list = [masker.mask_frame(colors[i]).mask for i in range(len(chunk_kfs))]
-                dynamic_mask = np.stack(masks_list, axis=0)
+                combined = []
+                for i in range(len(chunk_kfs)):
+                    frame_mask = np.zeros(colors[i].shape[:2], dtype=bool)
+                    if masker is not None:
+                        frame_mask |= masker.mask_frame(colors[i]).mask
+                    if semantic_masker is not None:
+                        frame_mask |= semantic_masker.mask_frame(colors[i]).mask
+                    combined.append(frame_mask)
+                dynamic_mask = np.stack(combined, axis=0)
             except Exception as e:
                 self._fallback("dense_point_cloud", e)
 
@@ -1175,7 +1194,8 @@ class Pipeline:
             # rather than pinned to one device, so masking work is spread
             # across both GPUs instead of bottlenecking on one.
             masker = self.masker0 if (chunk_idx % 2 == 0) else self.masker
-            self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, result, masker=masker)
+            semantic_masker = self.semantic_masker0 if (chunk_idx % 2 == 0) else self.semantic_masker
+            self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, result, masker=masker, semantic_masker=semantic_masker)
             self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac, rate_label=rate_label)
 
         dispatch_thread.join(timeout=60)

@@ -118,3 +118,95 @@ class DynamicObjectMasker:
 
     def mask_batch(self, frames_hwc: list[np.ndarray]) -> list[MaskResult]:
         return [self.mask_frame(f) for f in frames_hwc]
+
+
+# ADE20K class names (the training set for the SegFormer checkpoint below)
+# that are never part of the physical structure being reconstructed and are
+# exactly the classes that corrupt multi-view fusion the same way moving
+# objects do: water/sky have no stable, view-consistent depth (water is
+# reflective/textureless — multi-view matching either fails outright or
+# returns noisy, inconsistent depth; sky is at infinity and shouldn't
+# produce any 3D points at all). This is what was actually producing the
+# spiky/hallucinated Poisson artifacts over water in a real run — masking
+# these pixels out BEFORE they ever enter the fused point cloud fixes the
+# problem at its source, instead of trying to clean up Poisson's output
+# after the fact (density trimming can't tell "isolated noise" apart from
+# "real but sparser surface" — see mesh.py's build_vertex_colored_mesh).
+_IRRELEVANT_SEMANTIC_LABELS = {"water", "sea", "river", "lake", "swimming pool", "sky"}
+
+
+class SemanticMasker:
+    """SegFormer semantic segmentation (ADE20K-trained) to mask out
+    water/sky before fusion, alongside DynamicObjectMasker's moving-object
+    masking — both feed the same `dynamic_mask` exclusion mechanism in
+    fusion.py, just for different reasons (moving vs. never-should-be-
+    reconstructed). Lazily loaded, same resilience contract as
+    DynamicObjectMasker: never crashes the pipeline, degrades to an
+    all-clear mask (logged once) if transformers/the checkpoint aren't
+    available."""
+
+    def __init__(self, bus: EventBus, device: str = "cuda:1", model_name: str = "nvidia/segformer-b0-finetuned-ade-512-512"):
+        self.bus = bus
+        self.device = device
+        self.model_name = model_name
+        self.model = None
+        self.processor = None
+        self.irrelevant_ids: set[int] = set()
+        self.backend = "none"
+        self._load_attempted = False
+
+    def _ensure_loaded(self) -> None:
+        if self._load_attempted:
+            return
+        self._load_attempted = True
+        try:
+            import torch
+            from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+
+            t0 = time.time()
+            self.processor = SegformerImageProcessor.from_pretrained(self.model_name)
+            self.model = SegformerForSemanticSegmentation.from_pretrained(self.model_name).to(self.device).eval()
+            self.irrelevant_ids = {
+                int(i) for i, name in self.model.config.id2label.items()
+                if name.lower() in _IRRELEVANT_SEMANTIC_LABELS
+            }
+            self.backend = "segformer"
+            self.bus.log(
+                f"Semantic masker: loaded {self.model_name} on {self.device} in {time.time() - t0:.1f}s "
+                f"(masking classes: {sorted(self.model.config.id2label[i] for i in self.irrelevant_ids)})"
+            )
+        except Exception as e:
+            self.backend = "none"
+            self.bus.log(
+                f"Semantic masker unavailable ({type(e).__name__}: {e}) — "
+                f"proceeding with no water/sky exclusion",
+                level="warn",
+            )
+
+    def mask_frame(self, frame_hwc: np.ndarray) -> MaskResult:
+        self._ensure_loaded()
+        t0 = time.time()
+        h, w = frame_hwc.shape[:2]
+
+        if self.model is None:
+            return MaskResult(mask=np.zeros((h, w), dtype=bool), detections=0, backend="none", timing_s=time.time() - t0)
+
+        try:
+            import torch
+            import torch.nn.functional as F
+
+            inputs = self.processor(images=frame_hwc, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                logits = self.model(**inputs).logits  # (1, num_classes, h/4, w/4)
+            upsampled = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
+            pred = upsampled.argmax(dim=1)[0].cpu().numpy()
+        except Exception as e:
+            self.bus.log(f"Semantic mask inference failed on one frame ({e}); treating as no exclusion", level="warn")
+            return MaskResult(mask=np.zeros((h, w), dtype=bool), detections=0, backend="error_fallback", timing_s=time.time() - t0)
+
+        mask = np.isin(pred, list(self.irrelevant_ids)) if self.irrelevant_ids else np.zeros((h, w), dtype=bool)
+        return MaskResult(mask=mask, detections=int(mask.any()), backend=self.backend, timing_s=time.time() - t0)
+
+    def mask_batch(self, frames_hwc: list[np.ndarray]) -> list[MaskResult]:
+        return [self.mask_frame(f) for f in frames_hwc]

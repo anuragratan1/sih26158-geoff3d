@@ -274,6 +274,14 @@ def _step_ultralytics() -> None:
     else:
         _tqdm.write("  [already present] ultralytics")
 
+def _step_transformers() -> None:
+    # SegFormer semantic masking (water/sky exclusion before fusion —
+    # best-effort; masks.py's SemanticMasker degrades to no exclusion).
+    if not _try_import("transformers"):
+        _pip_install("transformers", label="transformers (SegFormer water/sky masking)")
+    else:
+        _tqdm.write("  [already present] transformers")
+
 def _step_pyrender() -> None:
     # GPU-accelerated offscreen mesh/point-cloud rendering for the 3D
     # Showcase cell, via EGL — not Vulkan (Open3D's rendering.OffscreenRenderer
@@ -329,6 +337,7 @@ _install_steps = [
     ("torchcodec (GPU decode)", _step_torchcodec),
     ("PyNvVideoCodec (GPU decode)", _step_pynvvideocodec),
     ("ultralytics (masking)", _step_ultralytics),
+    ("transformers (semantic masking)", _step_transformers),
     ("pyrender (3D showcase render)", _step_pyrender),
     ("mapanything (backbone)", _step_mapanything),
     ("verify mapanything + download weights", _step_verify_mapanything),
