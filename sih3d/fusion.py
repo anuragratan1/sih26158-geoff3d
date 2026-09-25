@@ -284,8 +284,7 @@ class Open3DTsdfFusion:
                 self.bus.log(
                     f"TSDF: voxel_size={self.voxel_size:.3f}m, sdf_trunc={self.sdf_trunc:.3f}m, "
                     f"depth_trunc={depth_trunc:.1f}m (first frame: {valid_frac * 100:.0f}% valid-depth pixels, "
-                    f"depth range {depth[depth > 0].min() if np.any(depth > 0) else 0:.1f}-{depth[depth > 0].max() if np.any(depth > 0) else 0:.1f}m)",
-                    level="warn",  # temporarily warn-level so it surfaces in report.json's warnings list while diagnosing the 44-triangle result; info-level logs aren't captured there at all
+                    f"depth range {depth[depth > 0].min() if np.any(depth > 0) else 0:.1f}-{depth[depth > 0].max() if np.any(depth > 0) else 0:.1f}m)"
                 )
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
                 color_img, depth_img, depth_scale=1.0, depth_trunc=depth_trunc, convert_rgb_to_intensity=False
