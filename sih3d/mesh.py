@@ -50,7 +50,7 @@ class TextureBakeResult:
 
 def build_vertex_colored_mesh(
     cloud: FusedPointCloud, tsdf: Open3DTsdfFusion | None, bus: EventBus,
-    poisson_depth: int = 9,
+    poisson_depth: int = 10,
 ) -> MeshResult:
     if tsdf is not None and tsdf.available:
         mesh = tsdf.extract_mesh()
@@ -72,15 +72,16 @@ def build_vertex_colored_mesh(
     points = cloud.points
     colors01 = np.clip(cloud.colors, 0, 255) / 255.0
 
-    # Cap the point count BEFORE normal estimation instead of just giving
-    # the MST orientation step more time: its cost scales with point count,
-    # so a bigger timeout on a bigger cloud just means a longer guaranteed
-    # wait, not a more reliable one. 200k points is comfortably enough
-    # density for a QUICK-mode mesh preview and keeps normal estimation +
-    # Poisson (which also benefits from fewer points) reliably inside their
-    # existing timeouts instead of needing them raised indefinitely as
-    # point count grows.
-    _MESH_POINT_CAP = 200_000
+    # Cap the point count BEFORE normal estimation — cost scales with point
+    # count, so a bigger timeout alone just means a longer guaranteed wait,
+    # not a more reliable one. Was 200k, which real output revealed was
+    # throwing away ~95% of the fused cloud (a 4.4M-point pointcloud.ply
+    # from one real run, vs. only 200k of it ever reaching Poisson) — that
+    # gap is real and worth spending more time on now that quality is the
+    # priority. 800k is a 4x increase, paired with a higher Poisson depth
+    # below so the extra density actually translates into a higher-
+    # resolution mesh instead of being wasted on an unchanged octree.
+    _MESH_POINT_CAP = 800_000
     if len(points) > _MESH_POINT_CAP:
         idx = np.random.default_rng(0).choice(len(points), size=_MESH_POINT_CAP, replace=False)
         points, colors01 = points[idx], colors01[idx]
@@ -98,16 +99,18 @@ def build_vertex_colored_mesh(
     # the watchdog). If both attempts fail, normals stays None and meshing
     # skips straight to the no-normals-needed Delaunay fallback below rather
     # than feeding Poisson/ball-pivoting normals that were never computed.
+    # Timeouts raised alongside the point cap above (4x points -> allow
+    # meaningfully more time, not the same budget for 4x the work).
     stage = "mesh_textured_model"
     normals = _run_isolated_meshing(
         _normals_worker, (points, colors01), bus, "normal estimation",
-        timeout_s=60.0, stage=stage, progress_range=(0.0, 0.15),
+        timeout_s=100.0, stage=stage, progress_range=(0.0, 0.15),
     )
     if normals is None:
         bus.log("Falling back to fast normal estimation without consistent orientation", level="warn")
         normals = _run_isolated_meshing(
             _normals_fast_worker, (points, colors01), bus, "normal estimation (fast)",
-            timeout_s=30.0, stage=stage, progress_range=(0.15, 0.25),
+            timeout_s=50.0, stage=stage, progress_range=(0.15, 0.25),
         )
 
     # Open3D's native Poisson/ball-pivoting solvers can hard-abort the whole
@@ -122,7 +125,7 @@ def build_vertex_colored_mesh(
     if normals is not None:
         poisson_out = _run_isolated_meshing(
             _poisson_worker, (points, colors01, normals, poisson_depth), bus, "Poisson",
-            stage=stage, progress_range=(0.25, 0.5),
+            timeout_s=90.0, stage=stage, progress_range=(0.25, 0.5),  # was the 45s default — not enough for 4x the points + depth 9->10
         )
         if poisson_out is not None:
             vertices, triangles, vcolors = poisson_out
