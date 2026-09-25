@@ -292,15 +292,61 @@ def solve_sim3(src: np.ndarray, dst: np.ndarray, weights: np.ndarray | None = No
     return scale, R, t, rmse
 
 
+def solve_rigid(src: np.ndarray, dst: np.ndarray, weights: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, float]:
+    """Kabsch algorithm: solve_sim3 with scale fixed at 1.0 — same math,
+    one fewer degree of freedom. Rotation+translation alone from a handful
+    of noisy correspondences is much better-conditioned than also fitting
+    scale: a bad scale estimate from just a few points is exactly what
+    turns "slightly off" into "this chunk's points are scattered across a
+    completely different volume than reality," which a real run hit."""
+    scale, R, t, rmse = solve_sim3(src, dst, weights)
+    # Re-fit t and rmse with scale pinned to 1.0 rather than reusing the
+    # Sim(3) solution's R (R doesn't depend on scale in Umeyama's method,
+    # so it's already the correct rigid-fit rotation).
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    w = np.ones(len(src)) if weights is None else np.asarray(weights, dtype=np.float64)
+    w = w / w.sum()
+    src_c = (src * w[:, None]).sum(axis=0)
+    dst_c = (dst * w[:, None]).sum(axis=0)
+    t_rigid = dst_c - (R @ src_c)
+    pred = (R @ src.T).T + t_rigid
+    rmse_rigid = float(np.sqrt(np.mean(np.sum((pred - dst) ** 2, axis=1))))
+    return R, t_rigid, rmse_rigid
+
+
 def align_chunk_to_previous(
     overlap_cam_centers_local: np.ndarray,      # this chunk's local coords, for cameras shared with the previous chunk
     overlap_cam_centers_prev_world: np.ndarray,  # those same cameras' already-resolved world coords
 ) -> ChunkAlignment:
-    scale, R, t, rmse = solve_sim3(overlap_cam_centers_local, overlap_cam_centers_prev_world)
-    return ChunkAlignment(
-        scale=scale, R=R, t=t, mode="sim3_chunk_overlap", georeferenced=False, rmse_m=rmse,
-        notes=["no GPS: aligned to previous chunk's overlap only, not to an absolute frame"],
-    )
+    """Fits both a full Sim(3) (scale+rotation+translation) and a rigid
+    (rotation+translation only, scale=1) transform from the same
+    correspondences, and picks the rigid one whenever the Sim(3) fit's
+    scale looks implausible (consecutive chunks of the same video/backbone
+    should have similar local scale, roughly — a wildly different one is a
+    sign the fit is unstable, not that the physical scale actually
+    changed) or its RMSE isn't meaningfully better than the rigid fit's
+    (i.e. the extra scale DOF bought accuracy, or just overfit noise).
+    Always logs both fits' numbers in `notes` so a real run's alignment
+    quality is traceable after the fact instead of only visible as "the
+    point cloud looked wrong" in a screenshot."""
+    scale, R_sim3, t_sim3, rmse_sim3 = solve_sim3(overlap_cam_centers_local, overlap_cam_centers_prev_world)
+    R_rigid, t_rigid, rmse_rigid = solve_rigid(overlap_cam_centers_local, overlap_cam_centers_prev_world)
+
+    scale_plausible = 0.3 <= scale <= 3.0
+    sim3_meaningfully_better = rmse_sim3 < 0.8 * rmse_rigid
+    use_sim3 = scale_plausible and sim3_meaningfully_better
+
+    notes = [
+        "no GPS: aligned to previous chunk's overlap only, not to an absolute frame",
+        f"sim3 fit: scale={scale:.3f}, rmse={rmse_sim3:.3f}m | rigid fit: scale=1.0, rmse={rmse_rigid:.3f}m -> using {'sim3' if use_sim3 else 'rigid'}",
+    ]
+    if not scale_plausible:
+        notes.append(f"sim3 scale {scale:.3f} outside plausible [0.3, 3.0] range — likely an unstable fit from too few/noisy correspondences")
+
+    if use_sim3:
+        return ChunkAlignment(scale=scale, R=R_sim3, t=t_sim3, mode="sim3_chunk_overlap", georeferenced=False, rmse_m=rmse_sim3, notes=notes)
+    return ChunkAlignment(scale=1.0, R=R_rigid, t=t_rigid, mode="rigid_chunk_overlap", georeferenced=False, rmse_m=rmse_rigid, notes=notes)
 
 
 def first_chunk_identity(georeferenced: bool) -> ChunkAlignment:

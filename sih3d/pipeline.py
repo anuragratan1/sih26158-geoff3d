@@ -84,7 +84,13 @@ class PipelineConfig:
     prior_mode: str = "AUTO"
     use_finetuned: bool = True
     chunk_size: int = 30
-    chunk_overlap: int = 6
+    # 6 was too few correspondence points for a well-conditioned chunk-to-
+    # chunk Sim(3)/rigid fit in no-GPS mode (align_chunk_to_previous) — a
+    # real run's second chunk got a badly-scattered alignment from just 6
+    # noisy points. 10 gives the fit meaningfully more (and, since drone
+    # flight paths are often close to linear, more spatially-diverse)
+    # correspondences to work with.
+    chunk_overlap: int = 10
     quick_seconds: float = 90.0
     # Balanced speed/quality: 28 (single-chunk, chunk_size=30) was the
     # fastest possible QUICK setting, but a real run showed the resulting
@@ -903,6 +909,15 @@ class Pipeline:
                     alignment = self.chunk_alignments[-1] if self.chunk_alignments else align.first_chunk_identity(False)
 
         self.chunk_alignments.append(alignment)
+        # Alignment quality was previously only visible as "the point cloud
+        # looks wrong" in a screenshot after a full run — logging it live,
+        # per chunk, means a bad fit (implausible scale, high RMSE) is
+        # traceable in the log at the moment it happens instead of only
+        # discoverable after the fact.
+        rmse_note = f", rmse={alignment.rmse_m:.3f}m" if alignment.rmse_m is not None else ""
+        self._log(f"Chunk {chunk_idx} alignment: mode={alignment.mode}, scale={alignment.scale:.3f}{rmse_note}")
+        for note in alignment.notes:
+            self._log(f"  Chunk {chunk_idx}: {note}")
         record = ChunkAlignmentRecord(chunk_idx=chunk_idx, mode=alignment.mode, rmse_before_m=alignment.rmse_m)
         self._chunk_alignment_records[chunk_idx] = record
         self.artifacts.chunk_alignments.append(record)
