@@ -138,6 +138,12 @@ class PreparedKeyframe:
     gps_enu: tuple[float, float, float] | None
     intrinsics: np.ndarray
     camera_pose_c2w_prior: np.ndarray | None
+    # Cached by _resized_intrinsics() below — one source of truth for the
+    # intrinsics that actually match the backbone-resolution image/points,
+    # instead of every call site independently rescaling kf.intrinsics (or,
+    # worse, forgetting to and unprojecting a small image with full-res
+    # intrinsics — see the TSDF corruption this was fixed for).
+    _intrinsics_resized_cache: tuple[int, np.ndarray] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -835,7 +841,7 @@ class Pipeline:
         views = [
             ViewInput(
                 image=_resize_for_backbone(kf.image_full, cfg.backbone_input_size),
-                intrinsics=self._scale_intrinsics(kf.intrinsics, kf.image_full.shape, cfg.backbone_input_size),
+                intrinsics=self._resized_intrinsics(kf, cfg.backbone_input_size),
                 camera_pose_c2w=kf.camera_pose_c2w_prior,
                 frame_index=kf.frame_index, timestamp_s=kf.timestamp_s,
             )
@@ -917,6 +923,33 @@ class Pipeline:
         K2[1, 1] *= sy
         K2[1, 2] *= sy
         return K2
+
+    def _resized_intrinsics(self, kf: PreparedKeyframe, target_size: int) -> np.ndarray:
+        """Single source of truth for "intrinsics that match the resized
+        (backbone-resolution) image" — cached per keyframe so every call
+        site (backbone ViewInput, TSDF unprojection) uses the exact same
+        scaled matrix instead of each independently re-deriving it (or, as
+        happened once, one call site forgetting to and unprojecting a
+        518x518 image with full-3840-res intrinsics)."""
+        cached = kf._intrinsics_resized_cache  # noqa: SLF001
+        if cached is not None and cached[0] == target_size:
+            return cached[1]
+        K = self._scale_intrinsics(kf.intrinsics, kf.image_full.shape, target_size)
+        kf._intrinsics_resized_cache = (target_size, K)  # noqa: SLF001
+        return K
+
+    @staticmethod
+    def _assert_intrinsics_match_image(K: np.ndarray, image_shape: tuple[int, int], label: str) -> None:
+        """Cheap sanity check before any unprojection: catches exactly the
+        class of bug that corrupted the TSDF mesh (intrinsics built for a
+        different resolution than the image/points being unprojected)."""
+        h, w = image_shape
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        assert 0 < cx < w, f"{label}: cx={cx:.1f} not inside image width {w} (intrinsics/image resolution mismatch)"
+        assert 0 < cy < h, f"{label}: cy={cy:.1f} not inside image height {h} (intrinsics/image resolution mismatch)"
+        max_dim = max(w, h)
+        assert 0.2 * max_dim < fx < 5.0 * max_dim, f"{label}: fx={fx:.1f} implausible for a {w}x{h} image (intrinsics/image resolution mismatch)"
+        assert 0.2 * max_dim < fy < 5.0 * max_dim, f"{label}: fy={fy:.1f} implausible for a {w}x{h} image (intrinsics/image resolution mismatch)"
 
     def _align_chunk(self, chunk_kfs: list[PreparedKeyframe], result: ChunkResult, chunk_idx: int) -> None:
         cam_local = result.camera_poses_est[:, :3, 3]
@@ -1101,9 +1134,12 @@ class Pipeline:
                     # scrambling every unprojected ray direction differently
                     # per pixel. That's what tore the TSDF mesh into
                     # incoherent, oversized triangles despite a clean point
-                    # cloud. Must rescale exactly like _infer_chunk_backbone
-                    # already does for the backbone's own ViewInput.
-                    intr = self._scale_intrinsics(kf.intrinsics, kf.image_full.shape, w)
+                    # cloud. _resized_intrinsics() is the same cached scaled
+                    # matrix _infer_chunk_backbone already computed for this
+                    # keyframe's ViewInput — one source of truth, not a
+                    # second independent rescale.
+                    intr = self._resized_intrinsics(kf, w)
+                    self._assert_intrinsics_match_image(intr, (h, w), label=f"TSDF unprojection, chunk {chunk_idx} frame {kf.frame_index}")
                     self.tsdf_fusion.integrate_chunk(pts_cam, colors[i], intr, pose, image_shape=(h, w))
                 except Exception as e:
                     self._fallback("dense_point_cloud", e)
