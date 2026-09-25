@@ -1091,7 +1091,20 @@ class Pipeline:
                         # excluded from the point-based fusion above.
                         pts_cam = pts_cam.copy()
                         pts_cam[..., 2][dynamic_mask[i]] = -1.0
-                    self.tsdf_fusion.integrate_chunk(pts_cam, colors[i], kf.intrinsics, pose, image_shape=(h, w))
+                    # kf.intrinsics is full-resolution (matches kf.image_full,
+                    # e.g. 3840x2160) but view_pts/colors here are squashed to
+                    # (h, w) = (backbone_input_size, backbone_input_size) by
+                    # _resize_for_backbone above — passing the unscaled
+                    # intrinsics into a PinholeCameraIntrinsic built for this
+                    # much smaller image put the principal point (e.g.
+                    # cx~1920) far outside the actual (e.g. 518-wide) image,
+                    # scrambling every unprojected ray direction differently
+                    # per pixel. That's what tore the TSDF mesh into
+                    # incoherent, oversized triangles despite a clean point
+                    # cloud. Must rescale exactly like _infer_chunk_backbone
+                    # already does for the backbone's own ViewInput.
+                    intr = self._scale_intrinsics(kf.intrinsics, kf.image_full.shape, w)
+                    self.tsdf_fusion.integrate_chunk(pts_cam, colors[i], intr, pose, image_shape=(h, w))
                 except Exception as e:
                     self._fallback("dense_point_cloud", e)
         # Full-resolution chunk, not downsampled — the inline viewer (see
