@@ -434,24 +434,46 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(CODE_DIR))  # CODE_DIR from the Setup cell above
+
+# Reload any sih3d.* submodule already cached in sys.modules BEFORE
+# importing sih3d.pipeline below. This has to happen first, not just
+# after (as a later pass in this cell also does): if sih3d.pipeline
+# previously failed to import (e.g. one of ITS submodules had a bug,
+# not pipeline.py itself), Python evicts sih3d.pipeline from sys.modules
+# on that failure but leaves the submodule that DID import successfully
+# still cached — stale. The `import sih3d.pipeline` line below would
+# then re-exec pipeline.py fresh, but pipeline.py's own
+# `from .mesh import X`-style lines pull from whatever's ALREADY in
+# sys.modules for that submodule, stale or not — so it fails again the
+# exact same way even after a successful Setup re-pull, and a
+# reload-loop placed only after this import never gets a chance to run
+# because the exception fires first. Reloading everything already
+# cached, before attempting the import, closes that gap.
+for _name in sorted(k for k in sys.modules if k == "sih3d" or k.startswith("sih3d.")):
+    try:
+        importlib.reload(sys.modules[_name])
+    except Exception as _e:
+        print(f"  [pre-reload warning] {_name}: {_e}")
+
 import sih3d.events as events_mod
 import sih3d.gpu_monitor as gpu_monitor_mod
 import sih3d.report as report_mod
 import sih3d.progress as progress_mod
 import sih3d.pipeline as pipeline_mod
 
-# Reload EVERY already-imported sih3d.* module, not just the five named
-# above — pipeline.py alone pulls in align/export/masks/backbone/mesh/
-# decode/fusion/io_detect/keyframes/telemetry/artifacts, and reloading only
-# pipeline_mod does NOT refresh any of those: `from .mesh import X` inside
-# pipeline.py just rebinds a name from the already-cached sys.modules
-# entry, so edits to mesh.py (or any other submodule) silently kept running
-# under the OLD code with no error. This is what forced a full kernel
-# restart for every one-line fix. Reloading every sih3d module already in
-# sys.modules (pipeline_mod last, so its rebinding sees the fresh objects)
-# means: after editing a %%writefile module-source cell above and
-# re-running it, you only need to re-run THIS cell — no restart, no
-# re-running Setup, install state and detected inputs are untouched.
+# Reload EVERY already-imported sih3d.* module again, not just the five
+# named above — pipeline.py alone pulls in align/export/masks/backbone/
+# mesh/decode/fusion/io_detect/keyframes/telemetry/artifacts, and
+# reloading only pipeline_mod does NOT refresh any of those: `from .mesh
+# import X` inside pipeline.py just rebinds a name from the already-
+# cached sys.modules entry, so edits to mesh.py (or any other submodule)
+# silently kept running under the OLD code with no error. This is what
+# forced a full kernel restart for every one-line fix. Reloading every
+# sih3d module already in sys.modules (pipeline_mod last, so its
+# rebinding sees the fresh objects) means: after editing a %%writefile
+# module-source cell above and re-running it, you only need to re-run
+# THIS cell — no restart, no re-running Setup, install state and
+# detected inputs are untouched.
 _pipeline_mod_ref = sys.modules.get("sih3d.pipeline")
 for _name in sorted(k for k in sys.modules if k == "sih3d" or k.startswith("sih3d.")):
     _m = sys.modules.get(_name)
