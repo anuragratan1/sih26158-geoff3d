@@ -526,7 +526,7 @@ class Pipeline:
             for chunk_idx, chunk_kfs in enumerate(chunks):
                 if self.stop_event.is_set():
                     break
-                chunk_result = self._process_chunk(bb, prior_mode, chunk_kfs, chunk_idx)
+                chunk_kfs, chunk_result = self._process_chunk(bb, prior_mode, chunk_kfs, chunk_idx)
                 frac = (chunk_idx + 1) / len(chunks)
                 rate_label = self._chunk_rate_label(chunk_idx + 1, len(chunks), geom_stage_t0)
                 self._emit(EventType.STAGE_PROGRESS, stage="geometric_reconstruction", frac=frac, rate_label=rate_label)
@@ -881,12 +881,22 @@ class Pipeline:
         conf_preview = result.confidence[0] if len(result.confidence) else None
         self._emit(EventType.GEOMETRY_CHUNK, depth=depth_preview, confidence=conf_preview)
 
-    def _process_chunk(self, bb, prior_mode: PriorMode, chunk_kfs: list[PreparedKeyframe], chunk_idx: int) -> ChunkResult | None:
+    def _process_chunk(
+        self, bb, prior_mode: PriorMode, chunk_kfs: list[PreparedKeyframe], chunk_idx: int,
+    ) -> tuple[list[PreparedKeyframe], ChunkResult | None]:
+        """Returns the (possibly OOM-truncated) chunk_kfs alongside the
+        result — callers MUST use this returned list downstream (masking/
+        fusion/TSDF), not their own original, un-truncated chunk_kfs. An
+        OOM halves the view count fed into the backbone, so `result`'s
+        arrays only have that many entries; pairing them with the original
+        full-length chunk_kfs corrupts every per-view zip downstream (this
+        is what caused a real broadcast-shape ValueError in
+        _mask_and_fuse_chunk when chunk 0 OOM'd 30->15 views)."""
         chunk_kfs, result = self._infer_chunk_backbone(bb, prior_mode, chunk_kfs, chunk_idx)
         if result is None:
-            return None
+            return chunk_kfs, None
         self._finish_chunk_alignment(chunk_kfs, result, chunk_idx)
-        return result
+        return chunk_kfs, result
 
     def _chunk_rate_label(self, done: int, total: int, stage_t0: float) -> str:
         """Shared by the single-GPU chunk loop and the DUAL_GPU stitcher —

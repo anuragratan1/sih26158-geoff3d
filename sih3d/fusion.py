@@ -217,29 +217,23 @@ class Open3DTsdfFusion:
             self.bus.log(f"Open3D not available ({e}) — TSDF meshing disabled, mesh.py will use point-based meshing", level="warn")
             return
 
-        try:
-            if hasattr(o3d, "core") and o3d.core.cuda.is_available():
-                self._device_tsdf = o3d.core.Device("CUDA:0")
-                self._volume = o3d.t.geometry.VoxelBlockGrid(
-                    attr_names=("tsdf", "weight", "color"),
-                    attr_dtypes=(o3d.core.float32, o3d.core.float32, o3d.core.float32),
-                    attr_channels=((1), (1), (3)),
-                    voxel_size=self.voxel_size, block_resolution=16, block_count=50000,
-                    device=self._device_tsdf,
-                )
-                self.backend = "open3d_tensor_cuda"
-                self.bus.log("TSDF fusion: using Open3D tensor CUDA VoxelBlockGrid")
-                return
-        except Exception as e:
-            self.bus.log(f"Open3D tensor CUDA TSDF unavailable ({e}); falling back to legacy CPU TSDF", level="warn")
-
+        # The tensor-CUDA VoxelBlockGrid path is deliberately never
+        # selected here: integrate_chunk()'s tensor-CUDA branch was left
+        # unimplemented (its exact integrate() signature differs across
+        # Open3D releases and was never verified against the version on
+        # this box), and extract_mesh() only reads out of the legacy CPU
+        # volume — so choosing the tensor backend silently integrates
+        # zero points every chunk and extract_mesh() always returns None,
+        # a guaranteed-empty mesh with no error anywhere. Going straight
+        # to the legacy CPU backend is slower but actually produces a
+        # real mesh, which is what "TSDF available" is supposed to mean.
         try:
             self._volume = o3d.pipelines.integration.ScalableTSDFVolume(
                 voxel_length=self.voxel_size, sdf_trunc=self.sdf_trunc,
                 color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
             )
             self.backend = "open3d_legacy_cpu"
-            self.bus.log("TSDF fusion: using Open3D legacy CPU ScalableTSDFVolume (slower — CUDA tensor path unavailable)")
+            self.bus.log("TSDF fusion: using Open3D legacy CPU ScalableTSDFVolume")
         except Exception as e:
             self.bus.log(f"Open3D legacy TSDF also unavailable ({e}) — TSDF meshing disabled", level="warn")
             self.backend = "none"

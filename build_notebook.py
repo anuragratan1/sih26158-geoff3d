@@ -319,6 +319,24 @@ def _step_pyrender() -> None:
     else:
         _tqdm.write("  [already present] pyrender")
 
+def _step_assimp() -> None:
+    # export.py's mesh.fbx output shells out to the `assimp` CLI
+    # (best-effort per the task spec) — not a pip package, needs the
+    # system binary. Without this it's silently "skipped" every run with
+    # no way to fix it short of the user manually apt-get-ing on Kaggle.
+    import shutil as _shutil
+
+    if _shutil.which("assimp") is not None:
+        _tqdm.write("  [already present] assimp CLI")
+        return
+    _r = subprocess.run(
+        ["apt-get", "install", "-y", "assimp-utils"], capture_output=True, text=True, timeout=120,
+    )
+    if _r.returncode == 0 and _shutil.which("assimp") is not None:
+        _tqdm.write("  [OK] installed assimp-utils")
+    else:
+        _tqdm.write(f"  [FAILED] assimp-utils install (mesh.fbx export will be skipped): {_r.stderr.strip()[-300:]}")
+
 def _step_mapanything() -> None:
     # MapAnything (Backbone C, the default) — a PLAIN pip install, no
     # --no-deps and no hand-picked extra-deps list: PHASE0_NOTES.md
@@ -354,6 +372,7 @@ _install_steps = [
     ("ultralytics (masking)", _step_ultralytics),
     ("transformers (semantic masking)", _step_transformers),
     ("pyrender (3D showcase render)", _step_pyrender),
+    ("assimp-utils (mesh.fbx export)", _step_assimp),
     ("mapanything (backbone)", _step_mapanything),
     ("verify mapanything + download weights", _step_verify_mapanything),
 ]
@@ -511,17 +530,29 @@ print(f"Video: {detected.video.path.name} | {detected.video.width}x{detected.vid
       f"{detected.video.fps:.1f} fps | mode={MODE} | GPUs={gpu_monitor.device_names}")
 pipeline.start()
 
-# The pipeline writes report state synchronously.  This loop only renders
-# lightweight text progress; it never serializes frames or updates widgets.
+# Every OTHER pipeline event already feeds `report` synchronously via the
+# pipeline's own _emit/_log (see pipeline.py) — forwarding them again here
+# would double-count things like keyframe_count and duplicate warnings.
+# GPU_SAMPLE/CPU_SAMPLE are the one exception: GpuMonitor's own background
+# thread calls bus.publish(...) directly and has no reference to `report`,
+# so this drain loop is the only place left that ever sees them. Without
+# forwarding just these two, report.json/report.html's
+# avg_gpu_util_pct/avg_cpu_util_pct columns stay empty for every stage
+# even though sampling itself is working fine.
+_REPORT_FORWARD_TYPES = (events_mod.EventType.GPU_SAMPLE, events_mod.EventType.CPU_SAMPLE)
 while pipeline.is_alive():
     for evt in bus.drain():
         progress.on_event(evt)
+        if evt.type in _REPORT_FORWARD_TYPES:
+            report.on_event(evt)
     time.sleep(0.1)
 
 # Final drain after the pipeline exits, so terminal progress catches final
 # stage completions and warnings.
 for evt in bus.drain():
     progress.on_event(evt)
+    if evt.type in _REPORT_FORWARD_TYPES:
+        report.on_event(evt)
 progress.close()
 
 report.write_json(Path(OUTPUT_DIR) / "report.json")
