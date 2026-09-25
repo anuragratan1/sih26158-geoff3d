@@ -70,16 +70,16 @@ PRIOR_MODE = "AUTO"
 # it as a dataset). Falls back to the stock pretrained backbone otherwise.
 USE_FINETUNED_CHECKPOINT = True
 
-# On by default now that QUICK mode's keyframe cap (60) reliably produces
-# ~2 chunks instead of 1 (chunk_size=30, overlap=6) — data-parallel
-# backbone across both GPUs (even chunks on cuda:0, odd on cuda:1, each
-# with its own prefetch queue; alignment stays single-threaded/ordered
-# afterward, since it carries state between consecutive chunks). Ignored
-# with a warning if fewer than 2 GPUs are detected. Set back to False for
-# a single-GPU baseline run (costs a second model load, ~doubling load
-# time, in exchange for the two chunks running in parallel instead of
-# sequential single-GPU).
-DUAL_GPU = True
+# Reverted back to False: enabling this for the first time with real
+# multi-chunk data produced a visibly WORSE point cloud (a dense correctly-
+# placed strip surrounded by a huge sparse scattered halo — the signature
+# of two chunks merged without a correct relative transform between them).
+# That's a real correctness bug in the DUAL_GPU alignment path, not
+# something to leave on speculatively — needs actual debugging before
+# re-enabling. Off by default: data-parallel backbone across both GPUs
+# (even chunks on cuda:0, odd on cuda:1). Ignored with a warning if fewer
+# than 2 GPUs are detected.
+DUAL_GPU = False
 
 # Off by default per the task spec: a viser server with a public share URL
 # for a full-resolution external live-3D view. Never blocks/crashes the
@@ -282,7 +282,14 @@ def _step_pyrender() -> None:
     # existing EGL library. Best-effort: stage_views.py falls back to a
     # flat-shaded matplotlib render if this isn't importable/working.
     if not _try_import("pyrender"):
-        _pip_install("pyrender pyopengl", label="pyrender (GPU offscreen render via EGL)")
+        # Two packages need two separate pip specs — "pyrender pyopengl" as
+        # ONE string makes pip try to install a package literally named
+        # "pyrender pyopengl" (with a space), which doesn't exist and fails
+        # in under a second. That's exactly the bug that made every run
+        # report "already present: False" and never actually install
+        # anything, no matter how many times Setup ran.
+        _pip_install("pyrender", label="pyrender (GPU offscreen render via EGL)")
+        _pip_install("pyopengl", label="pyopengl (pyrender dependency)")
     else:
         _tqdm.write("  [already present] pyrender")
 
