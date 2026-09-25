@@ -222,7 +222,19 @@ def render_vs_ground_truth(
             axes[1].set_facecolor((0.05, 0.06, 0.08))
             if point_result is not None:
                 vis_x, vis_y, vis_colors, point_coverage = point_result
-                axes[1].scatter(vis_x, vis_y, c=vis_colors, s=1.5, marker=".")
+                # Coverage above is computed from the full visible set;
+                # matplotlib's scatter() is pure CPU rasterization (no GPU
+                # path exists for this, regardless of what's installed) and
+                # visibly slow at the >100k points/panel this can reach at
+                # full image resolution — capping what's actually PLOTTED
+                # (display only, not the coverage math) to 20k is
+                # indistinguishable by eye at this figure size and much
+                # faster to render.
+                plot_x, plot_y, plot_c = vis_x, vis_y, vis_colors
+                if len(plot_x) > 20_000:
+                    plot_idx = np.random.default_rng(0).choice(len(plot_x), size=20_000, replace=False)
+                    plot_x, plot_y, plot_c = plot_x[plot_idx], plot_y[plot_idx], plot_c[plot_idx]
+                axes[1].scatter(plot_x, plot_y, c=plot_c, s=1.5, marker=".")
                 axes[1].set_xlim(0, w)
                 axes[1].set_ylim(h, 0)  # row 0 = top, matching imshow's convention on the left panel
                 axes[1].set_aspect("equal")
