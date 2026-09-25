@@ -408,8 +408,11 @@ def render_final_summary(report: ReportBuilder) -> None:
     display(HTML(f"<table><tr><th>Stage</th><th>Status</th><th>Elapsed</th><th>Avg GPU Util</th><th>Avg CPU Util</th></tr>{rows}</table>"))
     print(f"\nTotal elapsed: {d['total_elapsed_s']:.1f}s" if d["total_elapsed_s"] else "")
     print(f"Georeferenced: {d['georeferenced']}")
-    print(f"Alignment RMSE vs GPS: {d['alignment_rmse_m']} m")
+    rmse_label = "Alignment RMSE vs GPS" if d.get("alignment_rmse_units") == "m" else "Alignment RMSE (no GPS — unitless, camera-overlap fit only)"
+    rmse_suffix = " m" if d.get("alignment_rmse_units") == "m" else ""
+    print(f"{rmse_label}: {d['alignment_rmse_m']}{rmse_suffix}")
     print(f"Collinearity index: {d['collinearity_index']}")
+    print(f"Mesh: {d['mesh_faces']:,} faces (method: {d.get('mesh_method')})")
     if d["fallbacks_triggered"]:
         print(f"\n{len(d['fallbacks_triggered'])} fallback(s) triggered:")
         for f in d["fallbacks_triggered"]:

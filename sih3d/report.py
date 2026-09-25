@@ -173,9 +173,11 @@ class ReportBuilder:
             "georeferenced": self.georeferenced, "collinearity_index": self.collinearity_index,
             # No GPS -> alignment is fit purely from camera-overlap
             # correspondences in the backbone's own (unitless, arbitrary-
-            # scale) local frame, not meters — labeling it "_m" regardless
-            # implied a real physical accuracy number that isn't there.
-            "alignment_rmse_m" if self.georeferenced else "alignment_rmse_unitless": self.alignment_rmse_m,
+            # scale) local frame, not meters. Key name is fixed (not
+            # conditional) so every consumer of this dict keeps working;
+            # alignment_rmse_units says whether "m" is actually meaningful.
+            "alignment_rmse_m": self.alignment_rmse_m,
+            "alignment_rmse_units": "m" if self.georeferenced else "unitless",
             "keyframe_count": self.keyframe_count, "rejected_keyframe_count": self.rejected_keyframe_count,
             "point_count": self.point_count, "mesh_faces": self.mesh_faces, "mesh_method": self.mesh_method,
             "stages": stages_out, "fallbacks_triggered": self.fallbacks, "warnings": self.warnings,
@@ -222,8 +224,10 @@ class ReportBuilder:
             for o in d["outputs"]
         )
         fallback_items = "".join(f"<li class='warn'>{f}</li>" for f in d["fallbacks_triggered"]) or "<li>none</li>"
-        rmse = d.get("alignment_rmse_m", d.get("alignment_rmse_unitless"))
-        rmse_label = f"Alignment RMSE vs GPS: {rmse} m" if d['georeferenced'] else f"Alignment RMSE (no GPS — unitless, camera-overlap fit only): {rmse}"
+        rmse_label = (
+            f"Alignment RMSE vs GPS: {d['alignment_rmse_m']} m" if d['georeferenced']
+            else f"Alignment RMSE (no GPS — unitless, camera-overlap fit only): {d['alignment_rmse_m']}"
+        )
 
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>SIH26158 Pipeline Report</title>
