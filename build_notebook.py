@@ -871,13 +871,77 @@ Path(OUTPUT_DIR, "diag_step_b_colmap.json").write_text(json.dumps(results, inden
 print("\\nSaved diag_step_b_colmap.json")
 '''
 
+DIAG_STEP_C_CELL = '''
+# ============================== DIAGNOSTIC: Step C - OpenMVS on Kaggle ======
+# Tests the prebuilt Ubuntu x64 release binaries first (cheapest possible
+# check) before considering a from-source build. Measurement only.
+import json
+import subprocess
+from pathlib import Path
+
+diag_root = Path(OUTPUT_DIR) / "diag_step_c"
+diag_root.mkdir(parents=True, exist_ok=True)
+zip_path = diag_root / "OpenMVS_Ubuntu_x64.zip"
+bin_dir = diag_root / "bin"
+
+_dl = subprocess.run(
+    ["curl", "-sL", "-o", str(zip_path),
+     "https://github.com/cdcseacave/openMVS/releases/download/v2.4.0/OpenMVS_Ubuntu_x64.zip"],
+    capture_output=True, text=True, timeout=180,
+)
+print(f"Download: exit={_dl.returncode}, size={zip_path.stat().st_size if zip_path.exists() else 0} bytes")
+
+bin_dir.mkdir(exist_ok=True)
+_unzip = subprocess.run(["unzip", "-o", "-q", str(zip_path), "-d", str(bin_dir)], capture_output=True, text=True)
+print(f"Unzip: exit={_unzip.returncode}")
+if _unzip.returncode != 0:
+    print(_unzip.stderr[-1000:])
+
+all_bins = list(bin_dir.rglob("*"))
+exe_candidates = {p.name: p for p in all_bins if p.is_file() and (p.stat().st_mode & 0o111)}
+print(f"Executables found: {sorted(exe_candidates.keys())}")
+
+tools = ["InterfaceCOLMAP", "DensifyPointCloud", "ReconstructMesh", "RefineMesh", "TextureMesh"]
+results = {}
+for tool in tools:
+    path = exe_candidates.get(tool)
+    entry = {"found": path is not None}
+    if path is None:
+        print(f"\\n-- {tool}: NOT FOUND in release archive --")
+        results[tool] = entry
+        continue
+    path.chmod(0o755)
+    _ldd = subprocess.run(["ldd", str(path)], capture_output=True, text=True)
+    missing = [l.strip() for l in _ldd.stdout.splitlines() if "not found" in l]
+    entry["ldd_missing_libs"] = missing
+    _help = subprocess.run([str(path), "--help"], capture_output=True, text=True, timeout=30)
+    entry["help_returncode"] = _help.returncode
+    entry["help_ok"] = _help.returncode == 0 and len(_help.stdout) > 0
+    print(f"\\n-- {tool} ({path}) --")
+    print(f"ldd missing libs: {missing or 'none'}")
+    print(f"--help: exit={_help.returncode}, ok={entry['help_ok']}")
+    if not entry["help_ok"]:
+        print("  stderr:", (_help.stderr or "")[-500:])
+        print("  stdout:", (_help.stdout or "")[-500:])
+    results[tool] = entry
+
+n_working = sum(1 for v in results.values() if v.get("help_ok"))
+print(f"\\n{n_working}/{len(tools)} tools runnable from the prebuilt release with no missing libs and a working --help.")
+if n_working < len(tools):
+    print("Building from source was NOT attempted this run (would need a separate, longer Kaggle session -- "
+          "reporting the prebuilt-binary result only, as instructed to check that first).")
+
+Path(OUTPUT_DIR, "diag_step_c_openmvs.json").write_text(json.dumps(results, indent=2, default=str))
+print("\\nSaved diag_step_c_openmvs.json")
+'''
+
 
 def build() -> None:
     nb = nbf.v4.new_notebook()
     cells = [
         md(TITLE_MD), code(CONFIG_CELL), code(SETUP_CELL), md(CACHE_SAVE_NOTE_MD),
         code(LAUNCH_CELL), code(RESULTS_CELL), code(GROUND_TRUTH_CELL),
-        code(DIAG_STEP_A_CELL), code(DIAG_STEP_B_CELL),
+        code(DIAG_STEP_A_CELL), code(DIAG_STEP_B_CELL), code(DIAG_STEP_C_CELL),
     ]
 
     nb["cells"] = cells
