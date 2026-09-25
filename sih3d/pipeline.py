@@ -66,7 +66,7 @@ from .artifacts import ChunkAlignmentRecord, ChunkGeometrySample, KeyframeRecord
 from .backbone import ChunkResult, PriorMode, ViewInput
 from .decode import FrameDecoder
 from .events import Event, EventBus, EventType
-from .fusion import FusedPointCloud, VoxelPointFusion, remove_statistical_outliers
+from .fusion import FusedPointCloud, Open3DTsdfFusion, VoxelPointFusion, remove_statistical_outliers
 from .gpu_monitor import GpuMonitor
 from .io_detect import DetectedInputs
 from .keyframes import select_keyframes
@@ -250,6 +250,16 @@ class Pipeline:
 
         self.two_gpu = gpu_monitor.device_count >= 2
         self.fusion_acc = VoxelPointFusion(config.voxel_size_m, device=config.device0)
+        # Built, tested in isolation, but never actually wired up until now
+        # — TSDF fusion is visibility-aware by construction (ray carving
+        # handles free space, so it doesn't force a closed surface the way
+        # Poisson does) and needs no per-point camera-ID tracking, unlike
+        # OpenMVS's Delaunay+graph-cut. Depth per view comes from the
+        # backbone's own dense per-pixel world points, re-projected into
+        # camera space in _mask_and_fuse_chunk — no separate depth sensor
+        # needed. mesh.py prefers this over Poisson whenever it produces a
+        # non-empty mesh (see build_vertex_colored_mesh).
+        self.tsdf_fusion = Open3DTsdfFusion(self.bus, voxel_size_m=config.voxel_size_m)
         self.masker: masks.DynamicObjectMasker | None = None
         self.masker0: masks.DynamicObjectMasker | None = None  # DUAL_GPU only — device0's own masker, alongside self.masker on device1
         self.semantic_masker: masks.SemanticMasker | None = None
@@ -567,16 +577,22 @@ class Pipeline:
             self.artifacts.point_cloud_preview = cloud.points[preview_idx]
             self.artifacts.point_cloud_preview_colors = cloud.colors[preview_idx]
 
+        # Computed here (moved up from below build_vertex_colored_mesh)
+        # specifically to give it real camera positions for fast,
+        # timeout-free normal orientation — see mesh.py's
+        # _normals_camera_oriented_worker.
+        posed_keyframes = [kf for kf in keyframes if getattr(kf, "_resolved_world_pose", None) is not None]
+        camera_positions = np.array([kf._resolved_world_pose for kf in posed_keyframes]) if posed_keyframes else None
+
         mesh_result = mesh_mod.MeshResult(mesh=None, method="none")
         bake_result = None
         try:
-            mesh_result = mesh_mod.build_vertex_colored_mesh(cloud, tsdf=None, bus=self.bus)
+            mesh_result = mesh_mod.build_vertex_colored_mesh(cloud, tsdf=self.tsdf_fusion, bus=self.bus, camera_positions=camera_positions)
             if mesh_result.mesh is not None:
                 self._emit(EventType.MESH_PREVIEW, mesh=mesh_result, bake=None, stage="coarse")
         except Exception as e:
             self._fallback("mesh_textured_model", e)
 
-        posed_keyframes = [kf for kf in keyframes if getattr(kf, "_resolved_world_pose", None) is not None]
         try:
             if mesh_result.mesh is not None:
                 kf_for_bake = [
@@ -1046,6 +1062,28 @@ class Pipeline:
             points_world, colors, result.confidence, dynamic_mask=dynamic_mask,
             min_confidence=self.config.min_confidence,
         )
+
+        if self.tsdf_fusion.available:
+            for i, kf in enumerate(chunk_kfs):
+                try:
+                    pose = self._resolved_pose(kf, chunk_idx=None)
+                    w2c = np.linalg.inv(pose)
+                    view_pts = points_world[i]  # (H, W, 3), world frame
+                    h, w = view_pts.shape[:2]
+                    pts_h = np.concatenate([view_pts.reshape(-1, 3), np.ones((h * w, 1))], axis=1)
+                    pts_cam = (w2c @ pts_h.T).T[:, :3].reshape(h, w, 3)
+                    if dynamic_mask is not None:
+                        # Reuse integrate_chunk's own depth<=0 exclusion
+                        # (its documented "skip this pixel" signal) rather
+                        # than changing its signature — masked pixels
+                        # (water/sky/moving objects) must not re-enter the
+                        # reconstruction through the TSDF path after being
+                        # excluded from the point-based fusion above.
+                        pts_cam = pts_cam.copy()
+                        pts_cam[..., 2][dynamic_mask[i]] = -1.0
+                    self.tsdf_fusion.integrate_chunk(pts_cam, colors[i], kf.intrinsics, pose, image_shape=(h, w))
+                except Exception as e:
+                    self._fallback("dense_point_cloud", e)
         # Full-resolution chunk, not downsampled — the inline viewer (see
         # dashboard.py's Live 3D panel) needs real data to stream, and it
         # does its own LOD above 2M accumulated points. A too-small preview
