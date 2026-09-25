@@ -461,18 +461,26 @@ def bake_texture(
     except Exception as e:
         return TextureBakeResult(textured=False, skipped_reason=f"PIL not available ({e})")
 
-    # xatlas's UV-unwrap cost scales with face count, so — same principle
-    # as the point-count cap before normal estimation above — decimate
-    # first instead of just giving it more time on a bigger mesh. Quadric
-    # edge-collapse is a fast, well-behaved Open3D op (not run in isolation
-    # like the meshing steps: it doesn't share their crash/hang history)
-    # and a 30k-face cap is plenty for a QUICK-mode textured preview.
-    _BAKE_FACE_CAP = 30_000
+    # xatlas's UV-unwrap cost is dominated by chart segmentation, which
+    # grows charts one face at a time via a serial greedy priority queue —
+    # confirmed by design (not just an empirical guess): it's the documented
+    # bottleneck in xatlas itself, which is exactly why it scaled so badly
+    # and kept timing out at 30k faces. Same principle as the point-count
+    # cap before normal estimation above — decimate first instead of just
+    # giving it more time on a bigger mesh. Quadric edge-collapse is a fast,
+    # well-behaved Open3D op (not run in isolation like the meshing steps:
+    # it doesn't share their crash/hang history) and 15k faces is still
+    # plenty of triangles for a flat-per-face bake (mesh.py's own baking
+    # loop is deliberately one-flat-color-per-face, not per-texel — more
+    # faces than that don't add visible texture detail, only UV-unwrap
+    # cost).
+    _BAKE_FACE_CAP = 15_000
     if len(mesh.triangles) > _BAKE_FACE_CAP:
         n_before = len(mesh.triangles)
+        t_decimate = time.time()
         try:
             mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=_BAKE_FACE_CAP)
-            bus.log(f"Texture baking: decimated mesh {n_before:,} -> {len(mesh.triangles):,} faces for UV-unwrap speed")
+            bus.log(f"Texture baking: decimated mesh {n_before:,} -> {len(mesh.triangles):,} faces in {time.time()-t_decimate:.1f}s for UV-unwrap speed")
         except Exception as e:
             bus.log(f"Mesh decimation before texture baking failed ({e}); baking the full-resolution mesh instead", level="warn")
 
@@ -483,9 +491,9 @@ def bake_texture(
         mesh.compute_triangle_normals()
         normals = np.asarray(mesh.triangle_normals)
 
-    bus.log(f"Texture baking: UV-unwrapping {len(faces)} faces via xatlas (bounded to 45s)...")
+    bus.log(f"Texture baking: UV-unwrapping {len(faces)} faces via xatlas (bounded to 90s)...")
     unwrap = _run_isolated_xatlas(
-        vertices, faces, bus, timeout_s=45.0,
+        vertices, faces, bus, timeout_s=90.0,
         stage="mesh_textured_model", progress_range=(0.65, 0.85),
     )
     if unwrap is None:
