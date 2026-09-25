@@ -229,7 +229,10 @@ def _step_simple_deps() -> None:
     # No live widget/dashboard dependencies: they can monopolize Kaggle
     # vCPUs serializing previews while frame extraction is running.
     for _mod, _pkg in [
-        ("scipy", "scipy"), ("xatlas", "xatlas"), ("PIL", "pillow"),
+        # xatlas removed: mesh.py's texture baking is now vectorized
+        # per-vertex color sampling (bake_vertex_colors_from_keyframes),
+        # no UV atlas / xatlas dependency needed at all.
+        ("scipy", "scipy"), ("PIL", "pillow"),
         ("laspy", "laspy"), ("rasterio", "rasterio"), ("pyproj", "pyproj"),
         ("trimesh", "trimesh"), ("open3d", "open3d"), ("pymavlink", "pymavlink"),
         ("huggingface_hub", "huggingface_hub"), ("safetensors", "safetensors"),

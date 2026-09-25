@@ -579,9 +579,22 @@ class Pipeline:
                     KeyframeForBaking(image_rgb=kf.image_full, camera_pose_c2w=self._resolved_pose(kf, chunk_idx=None), intrinsics=kf.intrinsics)
                     for kf in posed_keyframes
                 ]
-                bake_result = mesh_mod.bake_texture(mesh_result.mesh, kf_for_bake, self.bus, time_budget_s=cfg.texture_time_budget_s)
-                if bake_result is not None and bake_result.textured:
-                    self._emit(EventType.MESH_PREVIEW, mesh=mesh_result, bake=bake_result, stage="textured")
+                # Vectorized per-vertex baking (mesh.py's
+                # bake_vertex_colors_from_keyframes), not the old
+                # xatlas-UV-atlas + nested-Python-loop path
+                # (mesh_mod.bake_texture, kept in mesh.py but no longer
+                # called by default): both of that path's slow parts
+                # (xatlas's own serial chart segmentation, and a per-face-
+                # times-per-keyframe Python loop) were classical CPU code
+                # that didn't scale, not an inherent cost of photo
+                # texturing — see bake_vertex_colors_from_keyframes's
+                # docstring. Runs on the full mesh (no decimation needed),
+                # mutates mesh_result.mesh.vertex_colors directly, so the
+                # existing vertex-colored export path in export.py already
+                # picks up the baked colors with no bake_result plumbing.
+                baked = mesh_mod.bake_vertex_colors_from_keyframes(mesh_result.mesh, kf_for_bake, self.bus)
+                if baked:
+                    self._emit(EventType.MESH_PREVIEW, mesh=mesh_result, bake=None, stage="textured")
         except Exception as e:
             self._fallback("mesh_textured_model", e)
 

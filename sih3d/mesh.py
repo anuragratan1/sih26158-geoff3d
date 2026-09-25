@@ -8,16 +8,19 @@ itself isn't available at all, meshing is skipped with a clearly logged
 reason — the pipeline still ships the point cloud (LAS/PLY), matching the
 robustness rule "log clearly if unavailable; never crash".
 
-Texture baking: xatlas UV-unwraps the mesh, then for each face we pick the
-"best view" among the full-resolution keyframes (most fronto-parallel,
-i.e. maximizing -dot(face_normal, view_direction), among cameras where the
-face's centroid actually projects inside the image) and fill that face's
-triangle in the atlas with the color sampled at its centroid's projection.
-This is a flat-per-face bake (constant color per triangle, not full per-texel
-projective sampling) — deliberately simpler than a full rasterizer, and
-still literally matches the task's own phrasing ("best-view per face").
-Skipped (logged) if it would blow the time budget or if xatlas isn't
-installed.
+Texture baking (bake_vertex_colors_from_keyframes): for each mesh vertex,
+picks the "best view" among the full-resolution keyframes (most
+fronto-parallel, i.e. maximizing -dot(vertex_normal, view_direction),
+among cameras where the vertex actually projects inside the image) and
+sets that vertex's color to the real photo pixel sampled there. Fully
+vectorized per keyframe (batched projection + scoring + color gather over
+every vertex at once), not per vertex or per face — no UV atlas, no
+xatlas dependency, no per-element Python loop. An earlier UV-atlas-based
+version (xatlas.parametrize + a nested per-face-times-per-keyframe Python
+loop) was replaced entirely: both of its slow parts were confirmed
+classical-CPU bottlenecks (xatlas's own documented serial chart
+segmentation, and unvectorized scalar Python math), not an inherent cost
+of photo texturing. Skipped (logged) if no keyframe sees any vertex.
 """
 
 from __future__ import annotations
@@ -392,43 +395,6 @@ def _run_isolated_meshing(
     return None
 
 
-def _xatlas_worker(vertices, faces, result_queue) -> None:
-    try:
-        import xatlas
-
-        vmapping, indices, uvs = xatlas.parametrize(vertices, faces)
-        result_queue.put((vmapping, indices, uvs))
-    except Exception as e:
-        result_queue.put(e)
-
-
-def _run_isolated_xatlas(
-    vertices, faces, bus: EventBus, timeout_s: float = 45.0,
-    stage: str | None = None, progress_range: tuple[float, float] = (0.0, 1.0),
-):
-    """xatlas.parametrize has no timeout or progress callback of its own
-    and can run for minutes on a mesh with many/poorly-parameterizable
-    faces — a real stall observed in practice as mesh_textured_model
-    sitting at 0% with no watchdog-visible progress for the entire
-    duration, since the per-face time-budget check further down in
-    bake_texture() never gets a chance to run until UV unwrapping is
-    already done. Delegates to _run_isolated_meshing's subprocess+timeout+
-    heartbeat machinery — the shape (isolate a single opaque blocking call,
-    time-box it, heartbeat while waiting) is identical, only the worker and
-    return payload differ."""
-    return _run_isolated_meshing(
-        _xatlas_worker, (vertices, faces), bus, "xatlas UV-unwrap", timeout_s=timeout_s,
-        stage=stage, progress_range=progress_range,
-    )
-
-
-@dataclass
-class KeyframeForBaking:
-    image_rgb: np.ndarray        # (H,W,3) uint8, full resolution
-    camera_pose_c2w: np.ndarray  # (4,4)
-    intrinsics: np.ndarray       # (3,3)
-
-
 def _project_points(points_world: np.ndarray, camera_pose_c2w: np.ndarray, intrinsics: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Returns (pixel_xy (N,2), depth (N,)) — depth <= 0 means behind the camera."""
     w2c = np.linalg.inv(camera_pose_c2w)
@@ -441,137 +407,83 @@ def _project_points(points_world: np.ndarray, camera_pose_c2w: np.ndarray, intri
     return pix_xy, depth
 
 
-def bake_texture(
-    mesh, keyframes: list[KeyframeForBaking], bus: EventBus,
-    time_budget_s: float = 60.0, atlas_resolution: int = 2048,
-) -> TextureBakeResult:
+def bake_vertex_colors_from_keyframes(mesh, keyframes: list[KeyframeForBaking], bus: EventBus) -> bool:
+    """Direct per-vertex color baking from real photos — no UV atlas, no
+    xatlas UV-unwrap, no per-face Python loop. Replaces the old bake_texture()
+    as the default texturing path: profiling and direct measurement on a
+    real run both pointed at the SAME kind of bug, not a fundamental "fast
+    vs. good" tradeoff — xatlas's own documented bottleneck is serial
+    per-face chart segmentation, and the old per-face loop here was ALSO a
+    nested Python for-loop (faces x keyframes) doing scalar math one pair
+    at a time. Neither of those slow things was the neural network or an
+    inherent property of "photo-realistic texturing" — they were just
+    classical CPU code that didn't scale, bolted on after an already-fast
+    feed-forward reconstruction pass.
+
+    This does the exact same "best fronto-parallel view wins" selection as
+    before, but vectorized per KEYFRAME (a handful, ~20-60) instead of per
+    VERTEX (hundreds of thousands): each keyframe does one batched
+    projection of every vertex via _project_points (the same vectorized
+    math the render-vs-ground-truth comparison already uses efficiently on
+    hundreds of thousands of points), then one batched score comparison
+    and one batched color gather — no per-element Python overhead at all.
+    Runs on the FULL mesh, not a decimated approximation, since there's no
+    chart-segmentation cost to control for anymore.
+
+    Mutates `mesh.vertex_colors` in place and returns whether anything was
+    baked; callers don't need a separate TextureBakeResult — the existing
+    vertex-colored export path (export_mesh_glb/obj/ply's `else` branch)
+    already picks up whatever's in vertex_colors, baked or not.
+    """
     t0 = time.time()
-    try:
-        import xatlas  # noqa: F401 — availability check; actual call is isolated below
-    except Exception as e:
-        return TextureBakeResult(textured=False, skipped_reason=f"xatlas not installed ({e})")
+    if mesh is None or len(mesh.vertices) == 0 or not keyframes:
+        return False
 
-    if mesh is None or len(mesh.triangles) == 0:
-        return TextureBakeResult(textured=False, skipped_reason="no mesh to texture")
-    if not keyframes:
-        return TextureBakeResult(textured=False, skipped_reason="no full-resolution keyframes available for baking")
-
-    try:
-        from PIL import Image, ImageDraw
-    except Exception as e:
-        return TextureBakeResult(textured=False, skipped_reason=f"PIL not available ({e})")
-
-    # xatlas's UV-unwrap cost is dominated by chart segmentation, which
-    # grows charts one face at a time via a serial greedy priority queue —
-    # confirmed by design (not just an empirical guess): it's the documented
-    # bottleneck in xatlas itself, which is exactly why it scaled so badly
-    # and kept timing out at 30k faces. Same principle as the point-count
-    # cap before normal estimation above — decimate first instead of just
-    # giving it more time on a bigger mesh. Quadric edge-collapse is a fast,
-    # well-behaved Open3D op (not run in isolation like the meshing steps:
-    # it doesn't share their crash/hang history) and 15k faces is still
-    # plenty of triangles for a flat-per-face bake (mesh.py's own baking
-    # loop is deliberately one-flat-color-per-face, not per-texel — more
-    # faces than that don't add visible texture detail, only UV-unwrap
-    # cost).
-    _BAKE_FACE_CAP = 15_000
-    if len(mesh.triangles) > _BAKE_FACE_CAP:
-        n_before = len(mesh.triangles)
-        t_decimate = time.time()
-        try:
-            mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=_BAKE_FACE_CAP)
-            bus.log(f"Texture baking: decimated mesh {n_before:,} -> {len(mesh.triangles):,} faces in {time.time()-t_decimate:.1f}s for UV-unwrap speed")
-        except Exception as e:
-            bus.log(f"Mesh decimation before texture baking failed ({e}); baking the full-resolution mesh instead", level="warn")
+    import open3d as o3d
 
     vertices = np.asarray(mesh.vertices)
-    faces = np.asarray(mesh.triangles)
-    normals = np.asarray(mesh.triangle_normals) if mesh.has_triangle_normals() else None
-    if normals is None:
-        mesh.compute_triangle_normals()
-        normals = np.asarray(mesh.triangle_normals)
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+    normals = np.asarray(mesh.vertex_normals)
+    n = len(vertices)
 
-    bus.log(f"Texture baking: UV-unwrapping {len(faces)} faces via xatlas (bounded to 90s)...")
-    unwrap = _run_isolated_xatlas(
-        vertices, faces, bus, timeout_s=90.0,
-        stage="mesh_textured_model", progress_range=(0.65, 0.85),
-    )
-    if unwrap is None:
-        return TextureBakeResult(textured=False, skipped_reason="xatlas UV-unwrap failed or timed out")
-    vmapping, indices, uvs = unwrap
-    # xatlas may duplicate/reorder vertices at UV seams; `vmapping` maps each
-    # new (post-unwrap) vertex back to its original vertex index.
-    unwrapped_positions = vertices[vmapping]
-    face_centroids_world = unwrapped_positions[indices].mean(axis=1)  # (n_faces, 3), matches `indices`' face order
-    face_normals = normals  # original per-triangle normals, same face order as `faces`/`indices` (xatlas preserves face order)
+    best_score = np.full(n, -1.0, dtype=np.float64)
+    best_color = np.zeros((n, 3), dtype=np.float64)
+    hit = np.zeros(n, dtype=bool)
 
-    atlas = Image.new("RGB", (atlas_resolution, atlas_resolution), (128, 128, 128))
-    draw = ImageDraw.Draw(atlas)
-
-    n_faces = len(indices)
-    baked = 0
-    skipped_time_budget = False
-    _last_progress_emit = 0.0
-
-    for fi in range(n_faces):
-        elapsed = time.time() - t0
-        if elapsed > time_budget_s:
-            skipped_time_budget = True
-            break
-        if elapsed - _last_progress_emit >= 0.5:
-            bus.publish(
-                EventType.STAGE_PROGRESS, stage="mesh_textured_model",
-                frac=0.85 + 0.15 * min(1.0, fi / max(n_faces, 1)),
-                rate_label=f"texture baking: {fi}/{n_faces} faces, {elapsed:.0f}s/{time_budget_s:.0f}s budget",
-            )
-            _last_progress_emit = elapsed
-
-        centroid = face_centroids_world[fi]
-        normal = face_normals[fi] if fi < len(face_normals) else np.array([0.0, 0.0, 1.0])
-
-        best_score = -1.0
-        best_color = None
-        for kf in keyframes:
-            view_dir = centroid - kf.camera_pose_c2w[:3, 3]
-            dist = np.linalg.norm(view_dir)
-            if dist < 1e-6:
-                continue
-            view_dir = view_dir / dist
-            facing = -float(np.dot(normal, view_dir))
-            if facing <= 0.05:  # back-facing or near-grazing: unusable
-                continue
-
-            pix, depth = _project_points(centroid[None, :], kf.camera_pose_c2w, kf.intrinsics)
-            if depth[0] <= 0:
-                continue
-            x, y = pix[0]
-            h, w = kf.image_rgb.shape[:2]
-            if not (0 <= x < w and 0 <= y < h):
-                continue
-
-            score = facing / max(dist, 1e-3)  # prefer fronto-parallel and close
-            if score > best_score:
-                best_score = score
-                best_color = kf.image_rgb[int(y), int(x)]
-
-        if best_color is None:
+    for kf in keyframes:
+        h, w = kf.image_rgb.shape[:2]
+        pix_xy, depth = _project_points(vertices, kf.camera_pose_c2w, kf.intrinsics)
+        x, y = pix_xy[:, 0], pix_xy[:, 1]
+        visible = (depth > 0) & (x >= 0) & (x < w - 1) & (y >= 0) & (y < h - 1)
+        if not visible.any():
             continue
 
-        uv_tri = uvs[indices[fi]] * atlas_resolution
-        poly = [(float(uv_tri[k, 0]), float(atlas_resolution - uv_tri[k, 1])) for k in range(3)]
-        draw.polygon(poly, fill=tuple(int(c) for c in best_color))
-        baked += 1
+        view_dir = vertices - kf.camera_pose_c2w[:3, 3]
+        dist = np.linalg.norm(view_dir, axis=1)
+        view_dir_n = view_dir / np.where(dist > 1e-6, dist, 1.0)[:, None]
+        score = -np.sum(normals * view_dir_n, axis=1)  # most fronto-parallel wins, same criterion as the old per-face bake
 
-    elapsed = time.time() - t0
-    if skipped_time_budget:
-        bus.log(f"Texture baking hit the time budget ({time_budget_s:.0f}s) after {baked}/{n_faces} faces — using partial bake", level="warn")
-    else:
-        bus.log(f"Texture baking: {baked}/{n_faces} faces colored in {elapsed:.1f}s")
+        better = visible & (score > best_score)
+        if not better.any():
+            continue
 
-    if baked == 0:
-        return TextureBakeResult(textured=False, skipped_reason="no face could be matched to any keyframe view", timing_s=elapsed)
+        xi = np.clip(x[better].astype(np.int32), 0, w - 1)
+        yi = np.clip(y[better].astype(np.int32), 0, h - 1)
+        best_color[better] = kf.image_rgb[yi, xi].astype(np.float64)
+        best_score[better] = score[better]
+        hit |= better
 
-    return TextureBakeResult(
-        textured=True, texture_rgb=np.array(atlas), uv=uvs[indices].reshape(-1, 2).astype(np.float32),
-        timing_s=elapsed,
-    )
+    if not hit.any():
+        bus.log("Vertex color baking: no vertices were visible in any keyframe — keeping the pre-bake mesh colors", level="warn")
+        return False
+
+    # Vertices no camera ever saw keep whatever color Poisson's own
+    # point-interpolation already gave them, rather than going black.
+    existing = np.asarray(mesh.vertex_colors) * 255.0 if mesh.has_vertex_colors() else np.full((n, 3), 128.0)
+    final_colors = np.where(hit[:, None], best_color, existing)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(final_colors / 255.0, 0.0, 1.0))
+
+    bus.log(f"Vertex color baking: {int(hit.sum()):,}/{n:,} vertices colored from real photos in {time.time()-t0:.1f}s (no UV atlas needed)")
+    return True
+
