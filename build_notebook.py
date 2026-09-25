@@ -119,17 +119,32 @@ _t0 = time.time()
 # debugging cell) with a fast-forward that would discard them.
 REPO_URL = "https://github.com/anuragratan1/sih26158-geoff3d.git"
 CODE_DIR = Path("/kaggle/working/sih26158-geoff3d")
+
+
+def _fresh_clone():
+    import shutil
+
+    if CODE_DIR.exists():
+        shutil.rmtree(CODE_DIR)
+    _c = subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(CODE_DIR)], capture_output=True, text=True, timeout=180)
+    if _c.returncode != 0:
+        raise RuntimeError(f"git clone of {REPO_URL} failed: {_c.stderr.strip()[-500:]}")
+    print(f"Code: cloned into {CODE_DIR}")
+
+
 if CODE_DIR.exists():
+    # --ff-only can fail (e.g. local edits, a stale/shallow history that
+    # can't fast-forward) — if so, don't silently keep running stale code:
+    # blow the checkout away and re-clone fresh. A silent stale checkout
+    # is exactly how a pushed fix can appear to "not apply" after a pull.
     _sync = subprocess.run(["git", "-C", str(CODE_DIR), "pull", "--ff-only"], capture_output=True, text=True, timeout=60)
     if _sync.returncode == 0:
         print(f"Code: pulled latest into {CODE_DIR}\\n{_sync.stdout.strip()}")
     else:
-        print(f"Code: pull failed, using existing checkout as-is ({_sync.stderr.strip()[-300:]})")
+        print(f"Code: pull failed ({_sync.stderr.strip()[-300:]}) — re-cloning fresh instead of using a possibly-stale checkout")
+        _fresh_clone()
 else:
-    _sync = subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(CODE_DIR)], capture_output=True, text=True, timeout=180)
-    if _sync.returncode != 0:
-        raise RuntimeError(f"git clone of {REPO_URL} failed: {_sync.stderr.strip()[-500:]}")
-    print(f"Code: cloned into {CODE_DIR}")
+    _fresh_clone()
 sys.path.insert(0, str(CODE_DIR))
 
 # -- 1. environment checks ---------------------------------------------------
