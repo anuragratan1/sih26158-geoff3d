@@ -70,15 +70,16 @@ PRIOR_MODE = "AUTO"
 # it as a dataset). Falls back to the stock pretrained backbone otherwise.
 USE_FINETUNED_CHECKPOINT = True
 
-# Off by default: data-parallel backbone across both GPUs (even chunks on
-# cuda:0, odd on cuda:1, each with its own prefetch queue; alignment stays
-# single-threaded/ordered afterward, since it carries state between
-# consecutive chunks). Ignored with a warning if fewer than 2 GPUs are
-# detected. Kept behind this flag rather than auto-enabled on 2 GPUs so a
-# single-GPU-backbone baseline run stays available on demand, unmixed with
-# the dual-GPU path's own behavior (double model load time, split logs, a
-# DUAL_GPU utilization summary at the end of geometric_reconstruction).
-DUAL_GPU = False
+# On by default now that QUICK mode's keyframe cap (60) reliably produces
+# ~2 chunks instead of 1 (chunk_size=30, overlap=6) — data-parallel
+# backbone across both GPUs (even chunks on cuda:0, odd on cuda:1, each
+# with its own prefetch queue; alignment stays single-threaded/ordered
+# afterward, since it carries state between consecutive chunks). Ignored
+# with a warning if fewer than 2 GPUs are detected. Set back to False for
+# a single-GPU baseline run (costs a second model load, ~doubling load
+# time, in exchange for the two chunks running in parallel instead of
+# sequential single-GPU).
+DUAL_GPU = True
 
 # Off by default per the task spec: a viser server with a public share URL
 # for a full-resolution external live-3D view. Never blocks/crashes the

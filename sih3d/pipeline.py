@@ -86,12 +86,17 @@ class PipelineConfig:
     chunk_size: int = 30
     chunk_overlap: int = 6
     quick_seconds: float = 90.0
-    # Kept under chunk_size (30): _make_chunks emits exactly one chunk when
-    # len(keyframes) <= chunk_size, which skips large_scale_alignment's
-    # cross-chunk blending entirely and runs the backbone exactly once.
-    # That's the single biggest lever on QUICK-mode wall time, well above
-    # what tuning decode speed alone can buy back.
-    quick_max_keyframes: int = 28
+    # Balanced speed/quality: 28 (single-chunk, chunk_size=30) was the
+    # fastest possible QUICK setting, but a real run showed the resulting
+    # point cloud visibly sparse/noisy — 28 keyframes just doesn't give the
+    # backbone enough viewpoints for good coverage, and no amount of mesh-
+    # side cleanup can add detail that was never captured. 60 keyframes
+    # gives real density with only ~2 chunks (chunk_size=30, overlap=6),
+    # which is exactly the regime DUAL_GPU (see below) exists for — those
+    # 2 chunks split across both GPUs instead of running single-GPU
+    # sequential, so the extra data doesn't just mean proportionally more
+    # wall time.
+    quick_max_keyframes: int = 60
     # FULL mode's own keyframe budget — chunk_size(30)/overlap(6) chunking
     # is otherwise unbounded for a long video: whatever fraction of decoded
     # candidates clears the sharpness floor becomes the keyframe count with
