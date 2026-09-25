@@ -286,14 +286,15 @@ def render_mesh_textured_model(artifacts: RunArtifacts) -> None:
 
 def _render_mesh_offscreen(mesh_path: str, plt) -> bool:
     """Tries a real lit/shaded render via pyrender's EGL backend (GPU,
-    headless offscreen — see stage_views.render_showcase's
-    _make_pyrender_snapshot for why EGL and not Open3D/Vulkan: Open3D's
-    rendering.OffscreenRenderer needs a Vulkan loader that errored out on a
-    real Kaggle session with "Failed to load vulkan library!"). Top-down +
-    oblique, matching the point-cloud preview's two views. Raises on any
-    failure — the caller already wraps this call and falls back to a flat
-    matplotlib wireframe, so this deliberately does NOT swallow errors
-    itself. Returns False only for the "loaded fine but empty mesh" case."""
+    headless offscreen — not Open3D/Vulkan: Open3D's rendering.
+    OffscreenRenderer needs a Vulkan loader that errored out on a real
+    Kaggle session with "Failed to load vulkan library!"; EGL is the
+    standard headless-GPU-rendering path used across ML/robotics tooling on
+    cloud GPU boxes instead). Top-down + oblique, matching the point-cloud
+    preview's two views. Raises on any failure — the caller already wraps
+    this call and falls back to a flat matplotlib wireframe, so this
+    deliberately does NOT swallow errors itself. Returns False only for the
+    "loaded fine but empty mesh" case."""
     import os
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     import pyrender
@@ -306,7 +307,7 @@ def _render_mesh_offscreen(mesh_path: str, plt) -> bool:
         return False
     if hasattr(m.visual, "to_color"):
         try:
-            m.visual = m.visual.to_color()  # bakes a real UV texture into vertex colors, same as render_showcase
+            m.visual = m.visual.to_color()  # bakes a real UV texture into vertex colors
         except Exception:
             pass
 
@@ -413,264 +414,6 @@ def render_final_summary(report: ReportBuilder) -> None:
         print(f"\n{len(d['fallbacks_triggered'])} fallback(s) triggered:")
         for f in d["fallbacks_triggered"]:
             print(" -", f)
-
-
-def _make_pyrender_snapshot(verts, faces, colors, points, point_colors, bounds, width: int = 640, height: int = 480):
-    """GPU-accelerated offscreen render via pyrender's EGL backend — real
-    lighting/shading on an actual triangle mesh (or a proper point
-    renderer, not a flat matplotlib scatter). EGL, not Vulkan: EGL is the
-    standard headless-GPU-rendering path used across ML/robotics tooling
-    on cloud GPU boxes and needs only the NVIDIA driver's existing EGL
-    library, no display server and no Vulkan loader — Open3D's
-    rendering.OffscreenRenderer needs Vulkan specifically (Filament), which
-    errored out on a real Kaggle session ("Failed to load vulkan
-    library!"). Returns (None, no-op) on ANY failure — missing package,
-    missing EGL, a context that fails on its first real render — so the
-    caller can fall back to the matplotlib path without this being fatal.
-    """
-    try:
-        import os
-        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-        import pyrender
-        import trimesh as _trimesh
-
-        scene = pyrender.Scene(bg_color=[0.05, 0.06, 0.08, 1.0], ambient_light=[0.35, 0.35, 0.35])
-        if verts is not None:
-            tm = _trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-            if colors is not None:
-                rgba = np.concatenate([np.clip(colors, 0, 1), np.ones((len(colors), 1))], axis=1)
-                tm.visual.face_colors = (rgba * 255).astype(np.uint8)
-            geom = pyrender.Mesh.from_trimesh(tm, smooth=False)
-        else:
-            rgba = None
-            if point_colors is not None:
-                rgba = np.concatenate([point_colors, np.ones((len(point_colors), 1))], axis=1)
-            geom = pyrender.Mesh.from_points(points, colors=rgba)
-        scene.add(geom)
-
-        center = np.array([(b[0] + b[1]) / 2.0 for b in bounds])
-        radius = float(np.linalg.norm([b[1] - b[0] for b in bounds])) or 10.0
-        elevation = radius * 0.5
-        up = np.array([0.0, 0.0, 1.0])  # ENU: Z is up (see viewer.py/telemetry.py)
-
-        def _look_at(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
-            # Standard OpenGL camera-to-world: camera looks down its own
-            # -Z, +Y up, +X right — the convention pyrender/glTF expects.
-            forward = target - eye
-            forward = forward / (np.linalg.norm(forward) or 1.0)
-            right = np.cross(forward, up)
-            right = right / (np.linalg.norm(right) or 1.0)
-            true_up = np.cross(right, forward)
-            pose = np.eye(4)
-            pose[:3, 0], pose[:3, 1], pose[:3, 2], pose[:3, 3] = right, true_up, -forward, eye
-            return pose
-
-        camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0, aspectRatio=width / height)
-        cam_node = scene.add(camera, pose=np.eye(4))
-        light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=4.0)
-        light_node = scene.add(light, pose=np.eye(4))
-        renderer = pyrender.OffscreenRenderer(width, height)
-
-        def _snapshot(azim_deg: float) -> np.ndarray:
-            rad = np.radians(azim_deg)
-            eye = center + np.array([radius * np.cos(rad), radius * np.sin(rad), elevation])
-            pose = _look_at(eye, center)
-            scene.set_pose(cam_node, pose)
-            scene.set_pose(light_node, pose)
-            color, _depth = renderer.render(scene)
-            return color
-
-        _snapshot(0.0)  # force a real render now — surfaces EGL/context failures here, not mid-video
-        return _snapshot, renderer.delete, None
-    except Exception as e:
-        import traceback
-        return None, (lambda: None), f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-
-
-def _make_matplotlib_snapshot(verts, faces, colors, points, point_colors, bounds, plt, Poly3DCollection):
-    """Flat-shaded fallback with no GPU rendering backend at all. See
-    render_showcase's docstring for why mplot3d's view_init needs no
-    separate "camera up" vector the way pyrender/any real camera does."""
-    fig = plt.figure(figsize=(6.4, 4.8), dpi=100)
-    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)  # no border padding around the 3D axes
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_facecolor((0.05, 0.06, 0.08))
-    fig.patch.set_facecolor((0.05, 0.06, 0.08))
-    if verts is not None:
-        ax.add_collection3d(Poly3DCollection(
-            verts[faces], facecolor=colors if colors is not None else "#888888", linewidths=0,
-        ))
-    else:
-        # No stored color -> color by height (z) instead of matplotlib's
-        # single flat default color, which at a small marker size on a
-        # near-black background was nearly invisible.
-        point_c = point_colors if point_colors is not None else points[:, 2]
-        point_cmap = None if point_colors is not None else "viridis"
-        ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=point_c, cmap=point_cmap, s=4.0, marker=".", depthshade=True)
-    ax.set_xlim(*bounds[0]); ax.set_ylim(*bounds[1]); ax.set_zlim(*bounds[2])
-    ax.set_box_aspect((bounds[0][1] - bounds[0][0], bounds[1][1] - bounds[1][0], bounds[2][1] - bounds[2][0]))
-    ax.axis("off")
-
-    def _snapshot(azim: float) -> np.ndarray:
-        ax.view_init(elev=25, azim=azim)
-        fig.canvas.draw()
-        return np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
-
-    return _snapshot, (lambda: plt.close(fig))
-
-
-def render_showcase(artifacts: RunArtifacts, n_photos: int = 3, video_frames: int = 90, video_fps: int = 15) -> None:
-    """Best-effort: a few stills + a short orbit video rendered straight
-    from the reconstructed mesh (falls back to the point cloud if no mesh
-    was produced), displayed inline so there's something to actually look
-    at without leaving the notebook or downloading anything.
-
-    Uses matplotlib, not Open3D's offscreen renderer — Open3D's high-level
-    `rendering.OffscreenRenderer` needs a working Vulkan loader (Filament),
-    which a real Kaggle GPU session does not have installed by default
-    ("Failed to load vulkan library!"), and installing system Vulkan
-    packages isn't something to gamble a notebook run on. matplotlib is
-    already a hard dependency of this file and needs no GPU rendering
-    backend at all — the tradeoff is a flat-shaded look, not a lit/
-    textured one, but it reliably renders on any box.
-
-    No separate "camera up" vector to get wrong here either: mplot3d's
-    `view_init(elev, azim)` is inherently relative to Z being vertical,
-    which already matches this pipeline's local-ENU (Z-up) point
-    convention (see viewer.py/telemetry.py) — the geometry is plotted
-    as-is, in its own (x, y, z) axes, with no separate up-vector to
-    misconfigure the way a real camera-based renderer has.
-    """
-    import subprocess
-    import tempfile
-    from pathlib import Path
-
-    from IPython.display import Video, display
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-    plt = _require_matplotlib()
-
-    mesh_path = artifacts.output_paths.get("mesh.glb") or artifacts.output_paths.get("mesh.obj")
-    cloud_path = artifacts.output_paths.get("pointcloud.ply")
-    if not mesh_path and not cloud_path:
-        print("Nothing to render yet: no mesh or point cloud output found.")
-        return
-
-    verts = faces = colors = points = point_colors = None
-    if mesh_path:
-        try:
-            import trimesh
-
-            m = trimesh.load(mesh_path, process=False)
-            if hasattr(m, "geometry"):  # a Scene (e.g. GLB) — take the first mesh
-                m = next(iter(m.geometry.values()))
-            # A successfully-baked mesh stores its real photo texture as a
-            # UV-mapped image (trimesh.visual.TextureVisuals), not vertex
-            # colors — reading only `.vertex_colors` silently threw away
-            # the actual baked texture whenever baking succeeded and fell
-            # back to whatever default gray vertex colors trimesh makes up
-            # for a texture-only mesh. to_color() bakes the real texture
-            # into real per-vertex colors first, so "the polished mesh"
-            # (texture-baked when available) is what actually gets shown,
-            # not silently the pre-baking vertex-colored version.
-            if hasattr(m.visual, "to_color"):
-                try:
-                    m.visual = m.visual.to_color()
-                except Exception:
-                    pass
-            verts, faces = np.asarray(m.vertices), np.asarray(m.faces)
-            if len(faces) > 20000:
-                idx = np.random.default_rng(0).choice(len(faces), size=20000, replace=False)
-                faces = faces[idx]
-            if hasattr(m.visual, "vertex_colors") and m.visual.vertex_colors is not None:
-                vc = np.asarray(m.visual.vertex_colors)[:, :3] / 255.0
-                colors = vc[faces].mean(axis=1)
-        except Exception as e:
-            print(f"Could not load {mesh_path} for showcase render ({e}); trying point cloud instead.")
-            verts = None
-    if verts is None and cloud_path:
-        try:
-            # trimesh, not Open3D: a plain PLY point cloud (no faces) loads
-            # as a trimesh.PointCloud with no GPU/rendering backend touched
-            # at all — Open3D's import alone was enough to trip the exact
-            # "Failed to load vulkan library!" this function exists to
-            # avoid (its Jupyter-environment auto-detection eagerly
-            # initializes the Filament/Vulkan-based renderer on import,
-            # regardless of whether anything then actually asks it to
-            # render), so it has no business being imported in this
-            # function at all, not even for pure point-cloud I/O.
-            import trimesh
-
-            pc = trimesh.load(cloud_path, process=False)
-            points = np.asarray(pc.vertices)
-            point_colors = None
-            if hasattr(pc, "colors") and pc.colors is not None and len(pc.colors):
-                point_colors = np.asarray(pc.colors)[:, :3] / 255.0
-            if len(points) > 100_000:
-                idx = np.random.default_rng(0).choice(len(points), size=100_000, replace=False)
-                points = points[idx]
-                if point_colors is not None:
-                    point_colors = point_colors[idx]
-        except Exception as e:
-            print(f"Could not load {cloud_path} for showcase render ({e}).")
-    if verts is None and points is None:
-        print("Showcase render skipped: nothing loadable.")
-        return
-
-    try:
-        all_pts = verts if verts is not None else points
-        # 1st-99th percentile, not raw min/max: a handful of outlier points
-        # (fusion isn't perfect even after remove_statistical_outliers) can
-        # blow the bounding box out to many times the actual structure's
-        # size, which is exactly what made the real orbit video show the
-        # object as a tiny dim speck in a mostly-empty frame — the axis
-        # limits were sized to fit outliers nobody wanted to see, not the
-        # object. A little padding (8%) keeps it from looking cropped.
-        lo = np.percentile(all_pts, 1, axis=0)
-        hi = np.percentile(all_pts, 99, axis=0)
-        pad = (hi - lo) * 0.08
-        lo, hi = lo - pad, hi + pad
-        bounds = list(zip(lo, hi))
-
-        _snapshot, cleanup, pyrender_error = _make_pyrender_snapshot(verts, faces, colors, points, point_colors, bounds)
-        if _snapshot is not None:
-            print("Rendering via pyrender (GPU, EGL) — real lit/shaded geometry.")
-        else:
-            print("pyrender/EGL unavailable; falling back to matplotlib (flat-shaded, no GPU renderer needed).")
-            print(f"pyrender error was:\n{pyrender_error}")
-            _snapshot, cleanup = _make_matplotlib_snapshot(verts, faces, colors, points, point_colors, bounds, plt, Poly3DCollection)
-
-        print(f"Rendering {n_photos} stills...")
-        for angle in np.linspace(0, 360, n_photos, endpoint=False):
-            frame = _snapshot(float(angle))
-            plt.figure(figsize=(6.4, 4.8), dpi=100)
-            plt.imshow(frame)
-            plt.axis("off")
-            plt.show()
-            plt.close()
-
-        print(f"Rendering a {video_frames}-frame orbit video...")
-        from PIL import Image as PILImage
-
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            for i in range(video_frames):
-                frame = _snapshot(360.0 * i / video_frames)
-                PILImage.fromarray(frame).save(tmp_path / f"frame_{i:04d}.png")
-
-            video_path = tmp_path / "orbit.mp4"
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-framerate", str(video_fps), "-i", str(tmp_path / "frame_%04d.png"),
-                 "-pix_fmt", "yuv420p", str(video_path)],
-                capture_output=True, text=True, timeout=60,
-            )
-            cleanup()
-            if result.returncode != 0 or not video_path.exists():
-                print(f"Orbit video assembly failed ({result.stderr.strip()[-300:]}); stills above are still available.")
-                return
-            display(Video(str(video_path), embed=True, html_attributes="controls loop"))
-    except Exception as e:
-        print(f"Showcase render failed ({type(e).__name__}: {e}); the downloadable mesh.glb/pointcloud.ply above are still valid.")
 
 
 def render_ground_truth_comparison(artifacts: RunArtifacts) -> None:

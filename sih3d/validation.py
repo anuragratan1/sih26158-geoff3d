@@ -9,9 +9,11 @@ Both reprojections use the keyframe's own real estimated intrinsics + pose,
 not a generic orbit view — this is a check against what the camera actually
 saw, not an approximation.
 
-Mesh panel: rendered via pyrender (GPU, EGL — see stage_views.py's
-_make_pyrender_snapshot for why EGL and not Open3D/Vulkan) using the
-keyframe's real intrinsics as a pyrender.IntrinsicsCamera and its real pose
+Mesh panel: rendered via pyrender (GPU, EGL — the standard headless-GPU-
+rendering path used across ML/robotics tooling on cloud GPU boxes; Open3D's
+rendering.OffscreenRenderer needs Vulkan instead, which errored out on a
+real Kaggle session) using the keyframe's real intrinsics as a
+pyrender.IntrinsicsCamera and its real pose
 converted from this pipeline's OpenCV camera convention (+Z forward, +Y
 down) to OpenGL's (-Z forward, +Y up). Loads from the actually-exported
 mesh.glb (not the pre-bake in-memory mesh) so a successful texture bake is

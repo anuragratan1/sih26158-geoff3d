@@ -537,27 +537,6 @@ for status in getattr(pipeline, "_export_statuses", []):
         display(FileLink(str(status.path)))
 '''
 
-VIEWER_CELL = '''
-# ============================== 3D SHOWCASE ==================================
-# A few stills + a short orbit video rendered straight from the mesh/point
-# cloud, so you can actually SEE the result without leaving the notebook or
-# downloading mesh.glb/pointcloud.ply to a separate viewer. Best-effort —
-# degrades to a clear message rather than crashing this cell if something's
-# unavailable. Separate cell from the ground-truth comparison below: a
-# combined cell's output got long enough (stills + video + 3 comparison
-# figures) to risk Kaggle truncating it, and each is easier to find on its
-# own anyway.
-import importlib
-import sys
-
-sys.path.insert(0, str(CODE_DIR))  # CODE_DIR from the Setup cell above
-import sih3d.stage_views as stage_views_mod
-importlib.reload(stage_views_mod)
-from sih3d.stage_views import render_showcase
-
-render_showcase(pipeline.artifacts)
-'''
-
 GROUND_TRUTH_CELL = '''
 # ============================== RENDER vs GROUND TRUTH =======================
 # The point cloud reprojected into a few real keyframe cameras (their
@@ -580,7 +559,7 @@ def build() -> None:
     nb = nbf.v4.new_notebook()
     cells = [
         md(TITLE_MD), code(CONFIG_CELL), code(SETUP_CELL), md(CACHE_SAVE_NOTE_MD),
-        code(LAUNCH_CELL), code(RESULTS_CELL), code(VIEWER_CELL), code(GROUND_TRUTH_CELL),
+        code(LAUNCH_CELL), code(RESULTS_CELL), code(GROUND_TRUTH_CELL),
     ]
 
     nb["cells"] = cells

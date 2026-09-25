@@ -601,8 +601,8 @@ class Pipeline:
         # export_mesh_glb() writes mesh.glb, so reading mesh_result.mesh
         # directly here would always show the pre-bake vertex-colored mesh,
         # silently ignoring a successful bake. Reading the exported GLB
-        # file (same as stage_views.render_showcase) is what actually shows
-        # the final polished mesh a bake produced.
+        # file is what actually shows the final polished mesh a bake
+        # produced.
         try:
             from .validation import _RenderKeyframe, render_vs_ground_truth
 
