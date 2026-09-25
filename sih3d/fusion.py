@@ -209,6 +209,7 @@ class Open3DTsdfFusion:
         self._volume = None
         self._device_tsdf = None
         self._logged_depth_trunc = False
+        self._logged_rgbd_depth_check = False
         self._init()
 
     def _init(self) -> None:
@@ -295,6 +296,15 @@ class Open3DTsdfFusion:
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
                 color_img, depth_img, depth_scale=1.0, depth_trunc=depth_trunc, convert_rgb_to_intensity=False
             )
+            if not self._logged_rgbd_depth_check:
+                self._logged_rgbd_depth_check = True
+                rgbd_depth = np.asarray(rgbd.depth)
+                nz = int(np.count_nonzero(rgbd_depth))
+                self.bus.log(
+                    f"TSDF: post-creation rgbd.depth check — min={rgbd_depth.min():.3f} max={rgbd_depth.max():.3f} "
+                    f"nonzero_pixels={nz}/{rgbd_depth.size} (all-zero would mean create_from_color_and_depth "
+                    f"itself is discarding the depth, independent of what integrate() then does with it)"
+                )
             extrinsic = np.linalg.inv(camera_pose_c2w)  # world-to-camera, what Open3D's legacy API expects
             self._volume.integrate(rgbd, intr, extrinsic)
         # Tensor-CUDA integration path intentionally omitted here: its exact

@@ -567,6 +567,11 @@ class Pipeline:
         self._emit(EventType.STAGE_DONE, stage="large_scale_alignment")
         self._emit(EventType.STAGE_DONE, stage="dense_point_cloud")
 
+        try:
+            self._debug_cross_view_depth_consistency()
+        except Exception as e:
+            self._log(f"Cross-view depth consistency check failed: {type(e).__name__}: {e}", level="warn")
+
         if dual_gpu:
             self._report_dual_gpu_utilization(geom_stage_t0)
 
@@ -1061,62 +1066,171 @@ class Pipeline:
         elif i == 1 and len(self._debug_tsdf_frames) >= 2:
             _integrate_and_extract(self._debug_tsdf_frames[:2], "two adjacent frames (0+1)")
 
-    def _debug_cross_view_depth_consistency(self, frames: list) -> None:
-        """Warps each keyframe's depth into its immediate temporal neighbor
-        and compares against that neighbor's own predicted depth at the
-        same pixel — the real number that should set sdf_trunc (per
-        explicit instruction: don't guess it), not touched until this
-        actually runs. Only meaningful to compute once the single/pair
-        integration test above has passed — a bug in the integration math
-        would masquerade as "high cross-view disagreement" otherwise."""
-        abs_diffs_m: list[np.ndarray] = []
-        rel_diffs: list[np.ndarray] = []
-        for a, b in zip(frames[:-1], frames[1:]):
-            pts_cam_a, _color_a, _intr_a, pose_a, h, w, kf_a = a
-            pts_cam_b, _color_b, intr_b, pose_b, _h2, _w2, kf_b = b
+    def _debug_collect_consistency_frame(
+        self, chunk_idx: int, i_in_chunk: int, kf: PreparedKeyframe,
+        pts_cam: np.ndarray, intr: np.ndarray, pose: np.ndarray, h: int, w: int, land_mask: np.ndarray,
+    ) -> None:
+        """Collects one keyframe's camera-space points/pose/intrinsics/land
+        mask for the end-of-reconstruction cross-view consistency check —
+        across ALL chunks now (not just chunk 0), so same-chunk vs
+        cross-chunk-boundary pairs can be told apart. `pts_cam` here is the
+        UNMASKED reprojection (before water/sky get zeroed for the real
+        TSDF path) so "all pixels" and "land-only" are actually different
+        numbers, not the same thing computed twice."""
+        if not hasattr(self, "_debug_consistency_frames"):
+            self._debug_consistency_frames = []
+        self._debug_consistency_frames.append({
+            "chunk_idx": chunk_idx, "pos_in_chunk": i_in_chunk, "frame_index": kf.frame_index,
+            "pts_cam": pts_cam.copy(), "intr": intr.copy(), "pose": pose.copy(),
+            "h": h, "w": w, "land_mask": land_mask.copy(),
+        })
 
-            valid_a = pts_cam_a[..., 2] > 0
-            if not valid_a.any():
-                continue
-            pts_a_flat = pts_cam_a.reshape(-1, 3)
-            valid_a_flat = valid_a.reshape(-1)
-            homog = np.concatenate([pts_a_flat[valid_a_flat], np.ones((valid_a_flat.sum(), 1))], axis=1)
-            world = (pose_a @ homog.T).T[:, :3]
-            cam_b = (np.linalg.inv(pose_b) @ np.concatenate([world, np.ones((len(world), 1))], axis=1).T).T[:, :3]
+    @staticmethod
+    def _warp_frame_a_onto_b(fa: dict, fb: dict, occlusion_px_threshold: float = 2.0):
+        """Warps every valid pixel of frame A into frame B's camera, and
+        also does the reverse (B's own depth at that pixel, warped back
+        into A) — a pixel only survives if that round trip lands within
+        `occlusion_px_threshold` pixels of where it started, which is the
+        standard forward-backward consistency check for excluding occluded
+        points (a real occlusion boundary breaks the round trip; noise in
+        an otherwise-consistent match usually doesn't). Returns arrays
+        aligned 1:1: z_warp, z_own, land_a, land_b, or None if no overlap."""
+        pts_cam_a, pose_a, h, w = fa["pts_cam"], fa["pose"], fa["h"], fa["w"]
+        pts_cam_b, intr_b, pose_b = fb["pts_cam"], fb["intr"], fb["pose"]
+        intr_a = fa["intr"]
 
-            z_warp = cam_b[:, 2]
-            in_front = z_warp > 0
-            fx, fy, cx, cy = intr_b[0, 0], intr_b[1, 1], intr_b[0, 2], intr_b[1, 2]
-            u = (fx * cam_b[:, 0] / np.where(in_front, z_warp, 1.0) + cx).round().astype(int)
-            v = (fy * cam_b[:, 1] / np.where(in_front, z_warp, 1.0) + cy).round().astype(int)
-            in_bounds = in_front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
-            if not in_bounds.any():
-                continue
+        valid_a = pts_cam_a[..., 2] > 0
+        if not valid_a.any():
+            return None
+        rows_a, cols_a = np.nonzero(valid_a)
+        pts_a_flat = pts_cam_a[rows_a, cols_a]
+        homog = np.concatenate([pts_a_flat, np.ones((len(pts_a_flat), 1))], axis=1)
+        world = (pose_a @ homog.T).T[:, :3]
+        pose_b_inv = np.linalg.inv(pose_b)
+        cam_b = (pose_b_inv @ np.concatenate([world, np.ones((len(world), 1))], axis=1).T).T[:, :3]
 
-            u_ok, v_ok, z_warp_ok = u[in_bounds], v[in_bounds], z_warp[in_bounds]
-            z_own = pts_cam_b[v_ok, u_ok, 2]
-            both_valid = z_own > 0
-            if not both_valid.any():
-                continue
-            diff = np.abs(z_warp_ok[both_valid] - z_own[both_valid])
-            abs_diffs_m.append(diff)
-            rel_diffs.append(diff / z_own[both_valid])
+        z_warp = cam_b[:, 2]
+        in_front = z_warp > 0
+        fx_b, fy_b, cx_b, cy_b = intr_b[0, 0], intr_b[1, 1], intr_b[0, 2], intr_b[1, 2]
+        z_safe = np.where(in_front, z_warp, 1.0)
+        u_b = fx_b * cam_b[:, 0] / z_safe + cx_b
+        v_b = fy_b * cam_b[:, 1] / z_safe + cy_b
+        u_b_i, v_b_i = u_b.round().astype(int), v_b.round().astype(int)
+        in_bounds = in_front & (u_b_i >= 0) & (u_b_i < fb["w"]) & (v_b_i >= 0) & (v_b_i < fb["h"])
+        if not in_bounds.any():
+            return None
 
-        if not abs_diffs_m:
-            self._log("Cross-view depth consistency: no overlapping valid pixels found between any adjacent frame pair", level="warn")
+        rows_a_ok, cols_a_ok = rows_a[in_bounds], cols_a[in_bounds]
+        u_b_ok, v_b_ok, z_warp_ok = u_b_i[in_bounds], v_b_i[in_bounds], z_warp[in_bounds]
+        z_own = pts_cam_b[v_b_ok, u_b_ok, 2]
+        both_valid = z_own > 0
+        if not both_valid.any():
+            return None
+        rows_a_ok, cols_a_ok = rows_a_ok[both_valid], cols_a_ok[both_valid]
+        u_b_ok, v_b_ok = u_b_ok[both_valid], v_b_ok[both_valid]
+        z_warp_ok, z_own_ok = z_warp_ok[both_valid], z_own[both_valid]
+
+        # forward-backward occlusion check: reconstruct B's own 3D point at
+        # (u_b_ok, v_b_ok) using B's own depth, send it back through A, and
+        # see how far it lands from where the pixel actually started.
+        fx_a, fy_a, cx_a, cy_a = intr_a[0, 0], intr_a[1, 1], intr_a[0, 2], intr_a[1, 2]
+        x_b = (u_b_ok - cx_b) * z_own_ok / fx_b
+        y_b = (v_b_ok - cy_b) * z_own_ok / fy_b
+        pt_b_own = np.stack([x_b, y_b, z_own_ok], axis=1)
+        world_back = (pose_b @ np.concatenate([pt_b_own, np.ones((len(pt_b_own), 1))], axis=1).T).T[:, :3]
+        cam_a_back = (np.linalg.inv(pose_a) @ np.concatenate([world_back, np.ones((len(world_back), 1))], axis=1).T).T[:, :3]
+        z_back = cam_a_back[:, 2]
+        z_back_safe = np.where(z_back > 0, z_back, 1.0)
+        u_a_back = fx_a * cam_a_back[:, 0] / z_back_safe + cx_a
+        v_a_back = fy_a * cam_a_back[:, 1] / z_back_safe + cy_a
+        roundtrip_dist = np.sqrt((u_a_back - cols_a_ok) ** 2 + (v_a_back - rows_a_ok) ** 2)
+        not_occluded = (z_back > 0) & (roundtrip_dist <= occlusion_px_threshold)
+
+        land_a = fa["land_mask"][rows_a_ok, cols_a_ok]
+        land_b = fb["land_mask"][v_b_ok, u_b_ok]
+        return z_warp_ok[not_occluded], z_own_ok[not_occluded], land_a[not_occluded], land_b[not_occluded]
+
+    def _debug_cross_view_depth_consistency(self) -> None:
+        """Runs once, after every chunk has been processed — measures how
+        much MapAnything's own per-view depth predictions actually agree
+        with each other (the number that should set sdf_trunc, per
+        explicit instruction: don't guess it). Broken down same-chunk vs
+        cross-chunk-boundary (tells model noise apart from chunk-alignment
+        error) and land-only vs all pixels (sky/water excluded via the
+        existing SegFormer mask), with occluded correspondences dropped via
+        a forward-backward round-trip check, and a self-warp sanity check
+        (a frame warped onto itself must read ~0) run first to validate the
+        warping math independent of any real cross-view disagreement."""
+        frames = getattr(self, "_debug_consistency_frames", None)
+        if not frames:
             return
+        try:
+            f0 = frames[0]
+            self_check = self._warp_frame_a_onto_b(f0, f0, occlusion_px_threshold=1e9)
+            if self_check is not None:
+                z_warp, z_own, _, _ = self_check
+                self._log(
+                    f"Self-warp sanity check (frame {f0['frame_index']} onto itself, {len(z_warp):,} px): "
+                    f"median |diff|={float(np.median(np.abs(z_warp - z_own))):.4f}m "
+                    f"(should be ~0 — validates the warping math itself, independent of real cross-view data)",
+                    level="warn",
+                )
+        except Exception as e:
+            self._log(f"Self-warp sanity check failed: {type(e).__name__}: {e}", level="warn")
 
-        all_abs = np.concatenate(abs_diffs_m)
-        all_rel = np.concatenate(rel_diffs)
-        med_abs, p90_abs = float(np.median(all_abs)), float(np.percentile(all_abs, 90))
-        med_rel, p90_rel = float(np.median(all_rel)) * 100, float(np.percentile(all_rel, 90)) * 100
-        suggested_sdf_trunc = p90_abs * 2.5
-        self._log(
-            f"Cross-view depth consistency ({len(frames) - 1} adjacent pairs, {len(all_abs):,} compared pixels): "
-            f"median |diff|={med_abs:.3f}m ({med_rel:.1f}% of depth), P90 |diff|={p90_abs:.3f}m ({p90_rel:.1f}% of depth). "
-            f"Suggested sdf_trunc ~= 2.5x P90 = {suggested_sdf_trunc:.3f}m (current: {self.config.voxel_size_m * 4:.3f}m) — not applied automatically.",
-            level="warn",
-        )
+        # Each bucket stores (abs_diff, rel_diff) pairs of arrays.
+        buckets: dict[tuple[str, str], list[tuple[np.ndarray, np.ndarray]]] = {
+            ("same_chunk", "land"): [], ("same_chunk", "all"): [],
+            ("cross_chunk", "land"): [], ("cross_chunk", "all"): [],
+        }
+        n_pairs = {"same_chunk": 0, "cross_chunk": 0}
+        for a, b in zip(frames[:-1], frames[1:]):
+            result = self._warp_frame_a_onto_b(a, b)
+            if result is None:
+                continue
+            z_warp, z_own, land_a, land_b = result
+            bucket_kind = "same_chunk" if a["chunk_idx"] == b["chunk_idx"] else "cross_chunk"
+            n_pairs[bucket_kind] += 1
+            diff = np.abs(z_warp - z_own)
+            rel = diff / z_own
+            buckets[(bucket_kind, "all")].append((diff, rel))
+            both_land = land_a & land_b
+            if both_land.any():
+                buckets[(bucket_kind, "land")].append((diff[both_land], rel[both_land]))
+
+        land_abs_all, land_rel_all = [], []
+        for (kind, subset), pairs in buckets.items():
+            if not pairs:
+                self._log(f"Cross-view depth consistency [{kind}, {subset}]: no data (0 pairs or 0 overlapping pixels)", level="warn")
+                continue
+            abs_concat = np.concatenate([p[0] for p in pairs])
+            rel_concat = np.concatenate([p[1] for p in pairs])
+            med_abs, p90_abs = float(np.median(abs_concat)), float(np.percentile(abs_concat, 90))
+            med_rel, p90_rel = float(np.median(rel_concat)) * 100, float(np.percentile(rel_concat, 90)) * 100
+            self._log(
+                f"Cross-view depth consistency [{kind}, {subset}] "
+                f"({n_pairs[kind]} pairs, {len(abs_concat):,} non-occluded compared px): "
+                f"median |diff|={med_abs:.3f}m ({med_rel:.1f}% of depth), P90 |diff|={p90_abs:.3f}m ({p90_rel:.1f}% of depth)",
+                level="warn",
+            )
+            if subset == "land":
+                land_abs_all.append(abs_concat)
+                land_rel_all.append(rel_concat)
+
+        if land_abs_all:
+            land_abs = np.concatenate(land_abs_all)
+            land_rel = np.concatenate(land_rel_all) * 100
+            med_abs, p90_abs = float(np.median(land_abs)), float(np.percentile(land_abs, 90))
+            med_rel, p90_rel = float(np.median(land_rel)), float(np.percentile(land_rel, 90))
+            suggested_sdf_trunc = p90_abs * 2.5
+            self._log(
+                f"Cross-view depth consistency [land-only, ALL pairs combined] ({len(land_abs):,} px): "
+                f"median |diff|={med_abs:.3f}m ({med_rel:.1f}% of depth), P90 |diff|={p90_abs:.3f}m ({p90_rel:.1f}% of depth). "
+                f"Target: median <2%, P90 <5%. Suggested sdf_trunc ~= 2.5x P90 = {suggested_sdf_trunc:.3f}m "
+                f"(current: {self.config.voxel_size_m * 4:.3f}m) — not applied automatically.",
+                level="warn",
+            )
+        del self._debug_consistency_frames  # one-shot diagnostic — free the held camera-space copies
 
     def _align_chunk(self, chunk_kfs: list[PreparedKeyframe], result: ChunkResult, chunk_idx: int) -> None:
         cam_local = result.camera_poses_est[:, :3, 3]
@@ -1282,6 +1396,7 @@ class Pipeline:
                     h, w = view_pts.shape[:2]
                     pts_h = np.concatenate([view_pts.reshape(-1, 3), np.ones((h * w, 1))], axis=1)
                     pts_cam = (w2c @ pts_h.T).T[:, :3].reshape(h, w, 3)
+                    pts_cam_unmasked = pts_cam  # kept for the consistency check's "all pixels" variant, before water/sky get zeroed below
                     if dynamic_mask is not None:
                         # Reuse integrate_chunk's own depth<=0 exclusion
                         # (its documented "skip this pixel" signal) rather
@@ -1307,6 +1422,15 @@ class Pipeline:
                     # second independent rescale.
                     intr = self._resized_intrinsics(kf, w)
                     self._assert_intrinsics_match_image(intr, (h, w), label=f"TSDF unprojection, chunk {chunk_idx} frame {kf.frame_index}")
+                    try:
+                        # land_mask=True means "not sky/water/moving-object"
+                        # (the inverse of dynamic_mask) — collected for every
+                        # chunk now, not just chunk 0, so cross-chunk-boundary
+                        # pairs are possible for the consistency breakdown.
+                        land_mask = ~dynamic_mask[i] if dynamic_mask is not None else np.ones((h, w), dtype=bool)
+                        self._debug_collect_consistency_frame(chunk_idx, i, kf, pts_cam_unmasked, intr, pose, h, w, land_mask)
+                    except Exception as e:
+                        self._log(f"Consistency-check frame collection failed (chunk {chunk_idx} frame {i}): {type(e).__name__}: {e}", level="warn")
                     if chunk_idx == 0:
                         try:
                             self._debug_tsdf_frame_test(i, kf, pts_cam, colors[i], intr, pose, h, w)
@@ -1315,13 +1439,6 @@ class Pipeline:
                     self.tsdf_fusion.integrate_chunk(pts_cam, colors[i], intr, pose, image_shape=(h, w))
                 except Exception as e:
                     self._fallback("dense_point_cloud", e)
-            if chunk_idx == 0 and getattr(self, "_debug_tsdf_frames", None):
-                try:
-                    self._debug_cross_view_depth_consistency(self._debug_tsdf_frames)
-                except Exception as e:
-                    self._log(f"Cross-view depth consistency check failed ({type(e).__name__}: {e})", level="warn")
-                finally:
-                    del self._debug_tsdf_frames  # one-shot diagnostic (chunk 0 only) — free the held camera-space copies
         # Full-resolution chunk, not downsampled — the inline viewer (see
         # dashboard.py's Live 3D panel) needs real data to stream, and it
         # does its own LOD above 2M accumulated points. A too-small preview
