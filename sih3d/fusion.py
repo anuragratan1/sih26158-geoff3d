@@ -255,7 +255,13 @@ class Open3DTsdfFusion:
         import open3d as o3d
 
         h, w = image_shape
-        depth = points_cam[..., 2].astype(np.float32)
+        # points_cam[..., 2] is a strided slice out of an (H,W,3) array —
+        # .astype() alone preserves that non-contiguous memory layout
+        # (order='K' by default), and a debug single-frame TSDF test
+        # confirmed the resulting depth array reaching o3d.geometry.Image()
+        # was C-contiguous=False, exactly the failure mode that produced a
+        # 0-vertex mesh from integrating one otherwise-valid depth map.
+        depth = np.ascontiguousarray(points_cam[..., 2], dtype=np.float32)
         depth[depth <= 0] = 0.0
 
         if self.backend == "open3d_legacy_cpu":
