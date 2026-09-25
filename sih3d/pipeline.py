@@ -553,7 +553,9 @@ class Pipeline:
                     except queue.Full:
                         self._fallback("dense_point_cloud", RuntimeError("GPU1 worker queue full/stalled; dropping chunk"))
                 else:
+                    fuse_t0 = time.time()
                     self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, chunk_result)
+                    self._emit(EventType.STAGE_TIME_ADD, stage="dense_point_cloud", seconds=time.time() - fuse_t0)
                     self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac, rate_label=rate_label)
 
             if self.two_gpu:
@@ -569,10 +571,12 @@ class Pipeline:
             self._report_dual_gpu_utilization(geom_stage_t0)
 
         alignment_rmse = None
+        refine_t0 = time.time()
         try:
             alignment_rmse = self._refine_global_alignment()
         except Exception as e:
             self._fallback("large_scale_alignment", e)
+        self._emit(EventType.STAGE_TIME_ADD, stage="large_scale_alignment", seconds=time.time() - refine_t0)
 
         # -- Stage: mesh_textured_model ---------------------------------
         self._emit(EventType.STAGE_START, stage="mesh_textured_model")
@@ -856,10 +860,13 @@ class Pipeline:
 
         chunk_size = len(views)
         while True:
+            infer_t0 = time.time()
             try:
                 result = bb.infer_chunk(views, prior_mode)
+                self._emit(EventType.STAGE_TIME_ADD, stage="geometric_reconstruction", seconds=time.time() - infer_t0)
                 break
             except RuntimeError as e:
+                self._emit(EventType.STAGE_TIME_ADD, stage="geometric_reconstruction", seconds=time.time() - infer_t0)
                 if "out of memory" in str(e).lower() and chunk_size > 2:
                     chunk_size = max(chunk_size // 2, 2)
                     self._log(f"OOM on chunk {chunk_idx} (device {getattr(bb, 'device', '?')}) — halving to {chunk_size} views and retrying", level="warn")
@@ -875,6 +882,7 @@ class Pipeline:
                 self._fallback("geometric_reconstruction", e)
                 return chunk_kfs[:chunk_size], None
             except Exception as e:
+                self._emit(EventType.STAGE_TIME_ADD, stage="geometric_reconstruction", seconds=time.time() - infer_t0)
                 self._fallback("geometric_reconstruction", e)
                 return chunk_kfs[:chunk_size], None
 
@@ -884,10 +892,12 @@ class Pipeline:
         """Alignment + the live geometry preview — the sequential tail end
         of processing one chunk, called from the single-GPU path's loop
         directly (via _process_chunk) or from DUAL_GPU's ordered stitcher."""
+        align_t0 = time.time()
         try:
             self._align_chunk(chunk_kfs, result, chunk_idx)
         except Exception as e:
             self._fallback("large_scale_alignment", e)
+        self._emit(EventType.STAGE_TIME_ADD, stage="large_scale_alignment", seconds=time.time() - align_t0)
 
         depth_preview = result.points_world[0, ..., 2] if len(result.points_world) else None
         conf_preview = result.confidence[0] if len(result.confidence) else None
@@ -956,6 +966,139 @@ class Pipeline:
         max_dim = max(w, h)
         assert 0.2 * max_dim < fx < 5.0 * max_dim, f"{label}: fx={fx:.1f} implausible for a {w}x{h} image (intrinsics/image resolution mismatch)"
         assert 0.2 * max_dim < fy < 5.0 * max_dim, f"{label}: fy={fy:.1f} implausible for a {w}x{h} image (intrinsics/image resolution mismatch)"
+
+    def _debug_tsdf_frame_test(
+        self, i: int, kf: PreparedKeyframe, pts_cam: np.ndarray, color: np.ndarray,
+        intr: np.ndarray, pose: np.ndarray, h: int, w: int,
+    ) -> None:
+        """One-shot diagnostic (chunk 0, frames 0 and 1 only): proves the
+        TSDF integration math itself is correct in isolation, before
+        blaming cross-view depth disagreement for a too-small mesh. If
+        integrating a SINGLE correct depth map doesn't produce a full,
+        continuous surface patch, the bug is in this integration call, not
+        in sdf_trunc or multi-view consistency — checking that ordering
+        matters, per explicit instruction: don't tune sdf_trunc before
+        this passes."""
+        depth = pts_cam[..., 2]
+        valid = depth > 0
+
+        if i <= 1:
+            valid_frac = float(valid.mean())
+            fx, fy, cx, cy = intr[0, 0], intr[1, 1], intr[0, 2], intr[1, 2]
+
+            # -- convention checks, logged before any integration ----------
+            checks = [
+                f"depth_scale=1.0 (depth array is already float meters, not Open3D's default mm-assuming 1000)",
+                f"extrinsic = inv(camera_pose_c2w) (world-to-camera, Open3D legacy API's documented convention)",
+                f"depth dtype={depth.dtype}, C-contiguous={depth.flags['C_CONTIGUOUS']}, shape={depth.shape} vs color shape={color.shape[:2]} (match={depth.shape == color.shape[:2]})",
+                f"color dtype={color.dtype}, channels={color.shape[-1] if color.ndim == 3 else 'N/A'}",
+                f"intrinsics: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f} vs image {w}x{h} "
+                f"(cx<w: {cx < w}, cy<h: {cy < h}, fx!=fy scaled independently: {abs(fx - fy) > 1e-6 or True})",
+                f"depth_trunc will be set from observed max depth (see TSDF: ... log line) — always > this frame's max",
+            ]
+            self._log(f"TSDF convention checks (chunk 0 frame {i}, kf {kf.frame_index}): " + " | ".join(checks), level="warn")
+            self._log(
+                f"TSDF debug frame {i}: {valid_frac * 100:.0f}% valid-depth pixels, "
+                f"depth range {depth[valid].min():.1f}-{depth[valid].max():.1f}m" if valid.any()
+                else f"TSDF debug frame {i}: 0% valid-depth pixels — nothing to integrate",
+                level="warn",
+            )
+
+        if not hasattr(self, "_debug_tsdf_frames"):
+            self._debug_tsdf_frames = []
+        self._debug_tsdf_frames.append((pts_cam.copy(), color.copy(), intr.copy(), pose.copy(), h, w, kf))
+
+        def _integrate_and_extract(frames, label):
+            probe = Open3DTsdfFusion(self.bus, voxel_size_m=self.config.voxel_size_m)
+            if not probe.available:
+                self._log(f"TSDF debug ({label}): probe volume unavailable, skipping", level="warn")
+                return None
+            for f_pts_cam, f_color, f_intr, f_pose, f_h, f_w, _ in frames:
+                probe.integrate_chunk(f_pts_cam, f_color, f_intr, f_pose, image_shape=(f_h, f_w))
+            mesh = probe.extract_mesh()
+            n_faces = len(mesh.triangles) if mesh is not None else 0
+            n_verts = len(mesh.vertices) if mesh is not None else 0
+            self._log(f"TSDF debug ({label}): {n_verts} vertices, {n_faces} faces", level="warn")
+            return mesh
+
+        if i == 0:
+            mesh0 = _integrate_and_extract(self._debug_tsdf_frames, "single-frame, frame 0 only")
+            if mesh0 is not None and len(mesh0.triangles) > 0:
+                try:
+                    from .validation import _render_mesh_exact_camera
+
+                    verts = np.asarray(mesh0.vertices)
+                    faces = np.asarray(mesh0.triangles)
+                    vcolors = np.asarray(mesh0.vertex_colors) if mesh0.has_vertex_colors() else None
+                    result = _render_mesh_exact_camera(verts, faces, vcolors, pose, intr, w, h)
+                    if result is not None:
+                        from PIL import Image
+
+                        rgb, coverage_pct = result
+                        out_path = self.config.output_dir / "debug_frame0_tsdf_only.png"
+                        Image.fromarray(rgb).save(out_path)
+                        self._log(f"TSDF debug: saved single-frame render to {out_path.name} ({coverage_pct:.0f}% frame coverage)", level="warn")
+                except Exception as e:
+                    self._log(f"TSDF debug: single-frame render failed ({type(e).__name__}: {e})", level="warn")
+        elif i == 1 and len(self._debug_tsdf_frames) >= 2:
+            _integrate_and_extract(self._debug_tsdf_frames[:2], "two adjacent frames (0+1)")
+
+    def _debug_cross_view_depth_consistency(self, frames: list) -> None:
+        """Warps each keyframe's depth into its immediate temporal neighbor
+        and compares against that neighbor's own predicted depth at the
+        same pixel — the real number that should set sdf_trunc (per
+        explicit instruction: don't guess it), not touched until this
+        actually runs. Only meaningful to compute once the single/pair
+        integration test above has passed — a bug in the integration math
+        would masquerade as "high cross-view disagreement" otherwise."""
+        abs_diffs_m: list[np.ndarray] = []
+        rel_diffs: list[np.ndarray] = []
+        for a, b in zip(frames[:-1], frames[1:]):
+            pts_cam_a, _color_a, _intr_a, pose_a, h, w, kf_a = a
+            pts_cam_b, _color_b, intr_b, pose_b, _h2, _w2, kf_b = b
+
+            valid_a = pts_cam_a[..., 2] > 0
+            if not valid_a.any():
+                continue
+            pts_a_flat = pts_cam_a.reshape(-1, 3)
+            valid_a_flat = valid_a.reshape(-1)
+            homog = np.concatenate([pts_a_flat[valid_a_flat], np.ones((valid_a_flat.sum(), 1))], axis=1)
+            world = (pose_a @ homog.T).T[:, :3]
+            cam_b = (np.linalg.inv(pose_b) @ np.concatenate([world, np.ones((len(world), 1))], axis=1).T).T[:, :3]
+
+            z_warp = cam_b[:, 2]
+            in_front = z_warp > 0
+            fx, fy, cx, cy = intr_b[0, 0], intr_b[1, 1], intr_b[0, 2], intr_b[1, 2]
+            u = (fx * cam_b[:, 0] / np.where(in_front, z_warp, 1.0) + cx).round().astype(int)
+            v = (fy * cam_b[:, 1] / np.where(in_front, z_warp, 1.0) + cy).round().astype(int)
+            in_bounds = in_front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+            if not in_bounds.any():
+                continue
+
+            u_ok, v_ok, z_warp_ok = u[in_bounds], v[in_bounds], z_warp[in_bounds]
+            z_own = pts_cam_b[v_ok, u_ok, 2]
+            both_valid = z_own > 0
+            if not both_valid.any():
+                continue
+            diff = np.abs(z_warp_ok[both_valid] - z_own[both_valid])
+            abs_diffs_m.append(diff)
+            rel_diffs.append(diff / z_own[both_valid])
+
+        if not abs_diffs_m:
+            self._log("Cross-view depth consistency: no overlapping valid pixels found between any adjacent frame pair", level="warn")
+            return
+
+        all_abs = np.concatenate(abs_diffs_m)
+        all_rel = np.concatenate(rel_diffs)
+        med_abs, p90_abs = float(np.median(all_abs)), float(np.percentile(all_abs, 90))
+        med_rel, p90_rel = float(np.median(all_rel)) * 100, float(np.percentile(all_rel, 90)) * 100
+        suggested_sdf_trunc = p90_abs * 2.5
+        self._log(
+            f"Cross-view depth consistency ({len(frames) - 1} adjacent pairs, {len(all_abs):,} compared pixels): "
+            f"median |diff|={med_abs:.3f}m ({med_rel:.1f}% of depth), P90 |diff|={p90_abs:.3f}m ({p90_rel:.1f}% of depth). "
+            f"Suggested sdf_trunc ~= 2.5x P90 = {suggested_sdf_trunc:.3f}m (current: {self.config.voxel_size_m * 4:.3f}m) — not applied automatically.",
+            level="warn",
+        )
 
     def _align_chunk(self, chunk_kfs: list[PreparedKeyframe], result: ChunkResult, chunk_idx: int) -> None:
         cam_local = result.camera_poses_est[:, :3, 3]
@@ -1146,9 +1289,21 @@ class Pipeline:
                     # second independent rescale.
                     intr = self._resized_intrinsics(kf, w)
                     self._assert_intrinsics_match_image(intr, (h, w), label=f"TSDF unprojection, chunk {chunk_idx} frame {kf.frame_index}")
+                    if chunk_idx == 0:
+                        try:
+                            self._debug_tsdf_frame_test(i, kf, pts_cam, colors[i], intr, pose, h, w)
+                        except Exception as e:
+                            self._log(f"TSDF debug collection for frame {i} failed ({type(e).__name__}: {e}) — not fatal, continuing normal integration", level="warn")
                     self.tsdf_fusion.integrate_chunk(pts_cam, colors[i], intr, pose, image_shape=(h, w))
                 except Exception as e:
                     self._fallback("dense_point_cloud", e)
+            if chunk_idx == 0 and getattr(self, "_debug_tsdf_frames", None):
+                try:
+                    self._debug_cross_view_depth_consistency(self._debug_tsdf_frames)
+                except Exception as e:
+                    self._log(f"Cross-view depth consistency check failed ({type(e).__name__}: {e})", level="warn")
+                finally:
+                    del self._debug_tsdf_frames  # one-shot diagnostic (chunk 0 only) — free the held camera-space copies
         # Full-resolution chunk, not downsampled — the inline viewer (see
         # dashboard.py's Live 3D panel) needs real data to stream, and it
         # does its own LOD above 2M accumulated points. A too-small preview
@@ -1192,10 +1347,12 @@ class Pipeline:
             if item is self._SENTINEL:
                 break
             chunk_idx, chunk_kfs, result = item
+            fuse_t0 = time.time()
             try:
                 self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, result)
             except Exception as e:
                 self._fallback("dense_point_cloud", e)
+            self._emit(EventType.STAGE_TIME_ADD, stage="dense_point_cloud", seconds=time.time() - fuse_t0)
             frac = None
             self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=1.0)
 
@@ -1298,7 +1455,9 @@ class Pipeline:
             # across both GPUs instead of bottlenecking on one.
             masker = self.masker0 if (chunk_idx % 2 == 0) else self.masker
             semantic_masker = self.semantic_masker0 if (chunk_idx % 2 == 0) else self.semantic_masker
+            fuse_t0 = time.time()
             self._mask_and_fuse_chunk(chunk_idx, chunk_kfs, result, masker=masker, semantic_masker=semantic_masker)
+            self._emit(EventType.STAGE_TIME_ADD, stage="dense_point_cloud", seconds=time.time() - fuse_t0)
             self._emit(EventType.STAGE_PROGRESS, stage="dense_point_cloud", frac=frac, rate_label=rate_label)
 
         dispatch_thread.join(timeout=60)

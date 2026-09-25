@@ -61,6 +61,14 @@ class ReportBuilder:
         self.finished_at: float | None = None
         self._gpu_samples: list[tuple[float, int, float]] = []
         self._cpu_samples: list[tuple[float, float]] = []
+        # geometric_reconstruction/large_scale_alignment/dense_point_cloud
+        # run interleaved per-chunk, not as one contiguous window each — a
+        # single start_ts/end_ts pair around the whole chunk loop makes all
+        # three report the SAME elapsed time (their shared start_ts/end_ts
+        # bracket), which is exactly what "reconstruction, alignment, and
+        # fusion share an identical 49.4s" was. Real per-stage cost is
+        # tracked here instead, summed across chunks via STAGE_TIME_ADD.
+        self._stage_elapsed_override: dict[str, float] = {}
 
     # -- event-driven updates -------------------------------------------------
 
@@ -85,6 +93,10 @@ class ReportBuilder:
             st = self.stages.get(p.get("stage"))
             if st:
                 st.status, st.end_ts = "error", evt.ts
+        elif evt.type == EventType.STAGE_TIME_ADD:
+            name = p.get("stage")
+            if name:
+                self._stage_elapsed_override[name] = self._stage_elapsed_override.get(name, 0.0) + p.get("seconds", 0.0)
         elif evt.type == EventType.GPU_SAMPLE:
             self._gpu_samples.append((p["ts"], p["index"], p["util_pct"]))
         elif evt.type == EventType.CPU_SAMPLE:
@@ -159,7 +171,9 @@ class ReportBuilder:
     def to_dict(self) -> dict:
         stages_out = []
         for name, st in self.stages.items():
-            elapsed = (st.end_ts - st.start_ts) if (st.start_ts and st.end_ts) else None
+            elapsed = self._stage_elapsed_override.get(name)
+            if elapsed is None:
+                elapsed = (st.end_ts - st.start_ts) if (st.start_ts and st.end_ts) else None
             stages_out.append({
                 "name": name, "status": st.status, "elapsed_s": elapsed,
                 "avg_gpu_util_pct": self.stage_avg_gpu_util(name),

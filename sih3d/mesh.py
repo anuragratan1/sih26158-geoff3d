@@ -42,6 +42,16 @@ class MeshResult:
     n_faces: int = 0
 
 
+# A mesh below this face count is not a real reconstruction, it's a
+# near-empty artifact (e.g. the 44-triangle TSDF result a too-tight
+# sdf_trunc/an integration bug can produce despite "extract_mesh()
+# returned a non-None mesh") — shared between the TSDF-vs-Poisson
+# fallback check here and export.py's own output validation, so a
+# degenerate mesh is caught the same way regardless of which check
+# happens to run.
+_MIN_USABLE_MESH_FACES = 10_000
+
+
 @dataclass
 class TextureBakeResult:
     textured: bool
@@ -58,6 +68,24 @@ class KeyframeForBaking:
     intrinsics: np.ndarray       # (3,3)
 
 
+def _bbox_footprint_coverage(mesh, cloud: FusedPointCloud) -> float:
+    """Fraction of the fused point cloud's XY (footprint) bounding-box area
+    that the mesh's own XY bounding box covers. A mesh confined to a tiny
+    corner of the scene (or degenerate/empty) — even if it happens to clear
+    the face-count floor — is just as unusable as too few faces; this is
+    the cheap proxy the fallback check uses for "does this even cover the
+    scene" without needing a full coverage-raster comparison."""
+    if len(cloud.points) == 0 or len(mesh.vertices) == 0:
+        return 0.0
+    cloud_xy = cloud.points[:, :2]
+    cloud_area = float(np.prod(cloud_xy.max(axis=0) - cloud_xy.min(axis=0)))
+    if cloud_area <= 0:
+        return 1.0  # degenerate (all points collinear/coincident) cloud bbox — nothing meaningful to compare against
+    mesh_xy = np.asarray(mesh.vertices)[:, :2]
+    mesh_area = float(np.prod(mesh_xy.max(axis=0) - mesh_xy.min(axis=0)))
+    return mesh_area / cloud_area
+
+
 def build_vertex_colored_mesh(
     cloud: FusedPointCloud, tsdf: Open3DTsdfFusion | None, bus: EventBus,
     poisson_depth: int = 9, camera_positions: np.ndarray | None = None,
@@ -65,9 +93,20 @@ def build_vertex_colored_mesh(
     if tsdf is not None and tsdf.available:
         mesh = tsdf.extract_mesh()
         if mesh is not None:
-            bus.log(f"Mesh: extracted via TSDF marching cubes ({len(mesh.vertices)} vertices)")
-            return MeshResult(mesh=mesh, method="tsdf_marching_cubes", n_vertices=len(mesh.vertices), n_faces=len(mesh.triangles))
-        bus.log("TSDF available but produced an empty mesh; falling back to point-based Poisson meshing", level="warn")
+            n_faces = len(mesh.triangles)
+            footprint_frac = _bbox_footprint_coverage(mesh, cloud)
+            if n_faces < _MIN_USABLE_MESH_FACES or footprint_frac < 0.5:
+                bus.log(
+                    f"TSDF mesh too small to be a real reconstruction (faces={n_faces}, "
+                    f"footprint={footprint_frac * 100:.0f}% of point cloud's XY bounding-box area) "
+                    f"— falling back to point-based Poisson meshing",
+                    level="warn",
+                )
+            else:
+                bus.log(f"Mesh: extracted via TSDF marching cubes ({len(mesh.vertices)} vertices)")
+                return MeshResult(mesh=mesh, method="tsdf_marching_cubes", n_vertices=len(mesh.vertices), n_faces=n_faces)
+        else:
+            bus.log("TSDF available but produced an empty mesh; falling back to point-based Poisson meshing", level="warn")
 
     try:
         import open3d as o3d

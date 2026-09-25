@@ -44,6 +44,7 @@ class EventType(str, Enum):
     TUNNEL_READY = "tunnel_ready"           # fullscreen_server.py: cloudflared URL (or failure) known, for outputs/viewer.html
     LIVE_PAGE_READY = "live_page_ready"     # live_page.py: cloudflared URL (or failure) known, for the live reconstruction page
     RASTERS_READY = "rasters_ready"         # export.py's DSM/orthomosaic/coverage paths, for the Rasters tab
+    STAGE_TIME_ADD = "stage_time_add"       # accumulate elapsed seconds for a stage whose work is interleaved across many chunks rather than one contiguous start/end window (payload: stage, seconds)
 
 
 @dataclass

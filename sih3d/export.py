@@ -20,7 +20,7 @@ import numpy as np
 
 from .events import EventBus
 from .fusion import FusedPointCloud
-from .mesh import MeshResult, TextureBakeResult
+from .mesh import _MIN_USABLE_MESH_FACES, MeshResult, TextureBakeResult
 from .telemetry import enu_to_geodetic
 
 
@@ -32,6 +32,23 @@ class ExportStatus:
     skipped_reason: str | None = None
     size_bytes: int = 0
     timing_s: float = 0.0
+
+
+def _mesh_export_status(name: str, path: Path, n_faces: int, timing_s: float) -> ExportStatus:
+    """Shared success/failure call for mesh.obj/glb/ply: a file that was
+    technically written but has too few faces to be a real reconstruction
+    (e.g. a 1.7 KB mesh.ply from a 44-triangle degenerate mesh) must not be
+    reported as OK — mesh.py's own TSDF-vs-Poisson fallback should already
+    prevent this at the source, but this is the export-side check so a
+    degenerate mesh is caught here too regardless of which meshing path
+    produced it."""
+    size = path.stat().st_size
+    if n_faces < _MIN_USABLE_MESH_FACES:
+        return ExportStatus(
+            name=name, path=None, ok=False, size_bytes=size, timing_s=timing_s,
+            skipped_reason=f"only {n_faces} faces (min usable: {_MIN_USABLE_MESH_FACES}) — not a real reconstruction",
+        )
+    return ExportStatus(name=name, path=path, ok=True, size_bytes=size, timing_s=timing_s)
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +176,8 @@ def export_mesh_obj(mesh_result: MeshResult, bake: TextureBakeResult | None, out
                 a, b, c = tri + 1
                 f.write(f"f {a} {b} {c}\n")
 
-    size = obj_path.stat().st_size
     bus.log(f"Wrote {obj_path.name}: {len(vertices)} verts, {len(triangles)} faces (textured={bake.textured if bake else False})")
-    return ExportStatus(name="mesh.obj", path=obj_path, ok=True, size_bytes=size, timing_s=time.time() - t0)
+    return _mesh_export_status("mesh.obj", obj_path, len(triangles), time.time() - t0)
 
 
 def export_mesh_glb(mesh_result: MeshResult, bake: TextureBakeResult | None, out_path: Path, bus: EventBus) -> ExportStatus:
@@ -198,9 +214,8 @@ def export_mesh_glb(mesh_result: MeshResult, bake: TextureBakeResult | None, out
         tm = trimesh.Trimesh(vertices=vertices, faces=triangles, vertex_colors=vertex_colors, process=False)
 
     tm.export(str(out_path))
-    size = out_path.stat().st_size
-    bus.log(f"Wrote {out_path.name} ({size / 1e6:.1f} MB)")
-    return ExportStatus(name="mesh.glb", path=out_path, ok=True, size_bytes=size, timing_s=time.time() - t0)
+    bus.log(f"Wrote {out_path.name} ({out_path.stat().st_size / 1e6:.1f} MB)")
+    return _mesh_export_status("mesh.glb", out_path, len(triangles), time.time() - t0)
 
 
 def export_mesh_ply(mesh_result: MeshResult, bake: TextureBakeResult | None, out_path: Path, bus: EventBus) -> ExportStatus:
@@ -244,9 +259,8 @@ def export_mesh_ply(mesh_result: MeshResult, bake: TextureBakeResult | None, out
         tm = trimesh.Trimesh(vertices=vertices, faces=triangles, vertex_colors=vertex_colors, process=False)
 
     tm.export(str(out_path))
-    size = out_path.stat().st_size
-    bus.log(f"Wrote {out_path.name} ({size / 1e6:.1f} MB)")
-    return ExportStatus(name="mesh.ply", path=out_path, ok=True, size_bytes=size, timing_s=time.time() - t0)
+    bus.log(f"Wrote {out_path.name} ({out_path.stat().st_size / 1e6:.1f} MB)")
+    return _mesh_export_status("mesh.ply", out_path, len(triangles), time.time() - t0)
 
 
 def export_mesh_fbx(obj_path: Path | None, out_path: Path, bus: EventBus) -> ExportStatus:
