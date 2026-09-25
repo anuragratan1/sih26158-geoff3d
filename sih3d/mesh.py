@@ -51,6 +51,13 @@ class TextureBakeResult:
     timing_s: float = 0.0
 
 
+@dataclass
+class KeyframeForBaking:
+    image_rgb: np.ndarray        # (H,W,3) uint8, full resolution
+    camera_pose_c2w: np.ndarray  # (4,4)
+    intrinsics: np.ndarray       # (3,3)
+
+
 def build_vertex_colored_mesh(
     cloud: FusedPointCloud, tsdf: Open3DTsdfFusion | None, bus: EventBus,
     poisson_depth: int = 9, camera_positions: np.ndarray | None = None,
