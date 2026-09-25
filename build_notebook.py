@@ -637,12 +637,247 @@ from sih3d.stage_views import render_ground_truth_comparison
 render_ground_truth_comparison(pipeline.artifacts)
 '''
 
+DIAG_STEP_A_CELL = '''
+# ============================== DIAGNOSTIC: Step A - decode strategies ======
+# Measurement only, per explicit direction: no new reconstruction code.
+# Compares GOP length / I-frame-only decode / raw NVDEC+scale_cuda against
+# the pipeline's own (already-measured) decode time, on the SAME video.
+import json
+import subprocess
+import time
+from pathlib import Path
+
+video_path = detected.video.path
+results = {}
+
+# -- GOP length (how far apart I-frames actually are) -----------------------
+_probe = subprocess.run(
+    ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+     "frame=pict_type", "-of", "csv=p=0", "-read_intervals", "%+#300", str(video_path)],
+    capture_output=True, text=True, timeout=60,
+)
+pict_types = [l.strip() for l in _probe.stdout.splitlines() if l.strip()]
+i_frame_positions = [i for i, t in enumerate(pict_types) if t == "I"]
+gop_lengths = [b - a for a, b in zip(i_frame_positions[:-1], i_frame_positions[1:])]
+avg_gop = sum(gop_lengths) / len(gop_lengths) if gop_lengths else None
+print(f"GOP: sampled {len(pict_types)} frames, {len(i_frame_positions)} I-frames, "
+      f"avg GOP length = {avg_gop} frames" if avg_gop else "GOP: could not determine (check ffprobe output)")
+results["gop_avg_frames"] = avg_gop
+
+# -- I-frame-only decode (-skip_frame nokey) ---------------------------------
+_t0 = time.time()
+_r = subprocess.run(
+    ["ffmpeg", "-v", "error", "-skip_frame", "nokey", "-i", str(video_path),
+     "-vsync", "0", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+    capture_output=True, timeout=120,
+)
+_elapsed = time.time() - _t0
+_n_bytes = len(_r.stdout)
+_frame_bytes = detected.video.width * detected.video.height * 3
+_n_iframes_decoded = _n_bytes // _frame_bytes if _frame_bytes else 0
+print(f"I-frame-only decode (-skip_frame nokey): {_elapsed:.1f}s, {_n_iframes_decoded} I-frames "
+      f"({_n_iframes_decoded / _elapsed:.1f} frames/s)" if _elapsed > 0 else "I-frame-only decode: 0s?")
+results["iframe_only_decode_s"] = _elapsed
+results["iframe_only_count"] = _n_iframes_decoded
+
+# -- raw NVDEC decode + GPU-side scale_cuda, bypassing our own decode.py's
+# CPU-scale fallback and PyNvVideoCodec entirely, to isolate whether
+# scale_cuda specifically is what's been unavailable ---------------------
+_target_w = 1920
+_target_h = int(round(detected.video.height * (_target_w / detected.video.width))) // 2 * 2
+_t0 = time.time()
+_r2 = subprocess.run(
+    ["ffmpeg", "-v", "error", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+     "-i", str(video_path), "-vf", f"scale_cuda={_target_w}:{_target_h}",
+     "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+    capture_output=True, timeout=120,
+)
+_elapsed2 = time.time() - _t0
+_ok2 = _r2.returncode == 0 and len(_r2.stdout) > 0
+_stderr2_tail = _r2.stderr[-500:].decode(errors="replace")
+print(f"NVDEC decode + scale_cuda ({_target_w}x{_target_h}): "
+      f"{'OK' if _ok2 else 'FAILED'}, {_elapsed2:.1f}s"
+      + ("" if _ok2 else f" — stderr tail: {_stderr2_tail}"))
+results["nvdec_scale_cuda_ok"] = _ok2
+results["nvdec_scale_cuda_s"] = _elapsed2 if _ok2 else None
+
+# -- for comparison: this run's OWN already-measured decode time -----------
+_own_decode_s = None
+for _s in report.to_dict()["stages"]:
+    if _s["name"] == "frame_extraction":
+        _own_decode_s = _s["elapsed_s"]
+print(f"Pipeline's own frame_extraction stage (this run, includes sharpness+selection, not just decode): {_own_decode_s}s")
+results["pipeline_frame_extraction_s"] = _own_decode_s
+results["video_duration_s"] = detected.video.duration_s if hasattr(detected.video, "duration_s") else None
+results["video_resolution"] = f"{detected.video.width}x{detected.video.height}"
+
+Path(OUTPUT_DIR, "diag_step_a_decode.json").write_text(json.dumps(results, indent=2))
+print("\\nSaved diag_step_a_decode.json")
+'''
+
+DIAG_STEP_B_CELL = '''
+# ============================== DIAGNOSTIC: Step B - MapAnything COLMAP export
+# Official facebookresearch/map-anything scripts/demo_colmap.py, run on the
+# exact same keyframes this notebook's own run used (saved to disk by
+# pipeline.py as a measurement-only side effect, see diag_keyframes/).
+# Measurement + glue only, per explicit direction — no new reconstruction code.
+import json
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+diag_root = Path(OUTPUT_DIR) / "diag_step_b"
+diag_root.mkdir(parents=True, exist_ok=True)
+keyframes_dir = Path(OUTPUT_DIR) / "diag_keyframes"
+n_keyframes = len(list(keyframes_dir.glob("*.jpg")))
+print(f"Keyframe images available for export: {n_keyframes}")
+
+_pip = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pycolmap==3.10.0"], capture_output=True, text=True)
+print("pycolmap install:", "OK" if _pip.returncode == 0 else _pip.stderr[-500:])
+
+demo_script_path = diag_root / "demo_colmap.py"
+subprocess.run(["curl", "-sL", "-o", str(demo_script_path),
+                 "https://raw.githubusercontent.com/facebookresearch/map-anything/main/scripts/demo_colmap.py"], check=True)
+print("demo_colmap.py fetched:", demo_script_path.exists(), demo_script_path.stat().st_size if demo_script_path.exists() else 0, "bytes")
+_has_use_ba = "--use_ba" in demo_script_path.read_text()
+print(f"This script has a --use_ba flag: {_has_use_ba} "
+      "(map-anything's own demo_colmap.py has NO bundle-adjustment option, unlike facebookresearch/vggt's "
+      "same-named script — only a single MapAnything-inference export pass is possible here)")
+
+
+class _MemSampler:
+    def __init__(self):
+        self.peak_mb = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            while not self._stop.is_set():
+                info = pynvml.nvmlDeviceGetMemoryInfo(h)
+                self.peak_mb = max(self.peak_mb, info.used / (1024 * 1024))
+                time.sleep(0.5)
+        except Exception as e:
+            print("  [mem sampler warning]", e)
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+
+
+def run_demo_colmap(output_dir, extra_args=None):
+    sampler = _MemSampler()
+    sampler.start()
+    t0 = time.time()
+    cmd = [sys.executable, str(demo_script_path), "--images_dir", str(keyframes_dir),
+           "--output_dir", str(output_dir), "--apache"] + (extra_args or [])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    elapsed = time.time() - t0
+    sampler.stop()
+    print(f"\\n-- demo_colmap.py -> {output_dir.name} --")
+    print(f"exit={result.returncode}, elapsed={elapsed:.1f}s, peak_gpu_mem={sampler.peak_mb:.0f}MB")
+    if result.returncode != 0:
+        print("STDERR (tail):", result.stderr[-2000:])
+    else:
+        print("STDOUT (tail):", result.stdout[-800:])
+    return {"elapsed_s": elapsed, "peak_gpu_mem_mb": sampler.peak_mb, "returncode": result.returncode}
+
+out_dir = diag_root / "colmap_export"
+run_result = run_demo_colmap(out_dir)
+
+results = {"has_use_ba_flag": _has_use_ba, "n_keyframes": n_keyframes, "export": run_result}
+
+sparse_dir = out_dir / "sparse"
+if sparse_dir.exists():
+    try:
+        import pycolmap
+        recon = pycolmap.Reconstruction(str(sparse_dir))
+        cams = list(recon.cameras.values())
+        cam0 = cams[0] if cams else None
+        print(f"\\nExported COLMAP model: {len(recon.images)} images, {len(recon.points3D)} 3D points, {len(recon.cameras)} camera(s)")
+        if cam0 is not None:
+            print(f"Camera resolution in export: {cam0.width}x{cam0.height} "
+                  f"(full-res keyframes were {detected.video.width}x{detected.video.height} -- "
+                  f"{'MATCHES full res' if cam0.width == detected.video.width else 'does NOT match full res, needs intrinsics rescale for full-res texturing'})")
+            results["export_camera_resolution"] = f"{cam0.width}x{cam0.height}"
+
+        # "BA reprojection error" - COLMAP's own per-point mean track error,
+        # already computed by the export (no separate --use_ba pass exists
+        # to run here, see above).
+        errors = [p.error for p in recon.points3D.values() if p.error is not None and p.error > 0]
+        if errors:
+            import numpy as _np
+            print(f"Reprojection error across {len(errors)} points3D: "
+                  f"mean={_np.mean(errors):.3f}px, median={_np.median(errors):.3f}px, "
+                  f"P90={_np.percentile(errors, 90):.3f}px")
+            results["reprojection_error_px"] = {
+                "mean": float(_np.mean(errors)), "median": float(_np.median(errors)),
+                "p90": float(_np.percentile(errors, 90)), "n_points": len(errors),
+            }
+        else:
+            print("No points3D.error values found (points2D may have been skipped, or all points are new)")
+
+        # -- Self-warp / reprojection check using the EXPORTED cameras: for
+        # each image, reproject its own observed track points through its
+        # own recorded pose+intrinsics and compare to the observed pixel.
+        # This is the correct, direct version of the ad-hoc self-warp test
+        # from the custom-TSDF debugging phase (frozen per explicit
+        # direction) -- target: under 1px.
+        import numpy as _np
+        all_px_err = []
+        for img in recon.images.values():
+            cam = recon.cameras[img.camera_id]
+            cam_from_world = img.cam_from_world
+            for p2d in img.points2D:
+                if not p2d.has_point3D():
+                    continue
+                pt3d = recon.points3D[p2d.point3D_id].xyz
+                pt_cam = cam_from_world * pt3d
+                if pt_cam[2] <= 0:
+                    continue
+                uv_reproj = cam.img_from_cam(pt_cam)
+                err = float(_np.linalg.norm(uv_reproj - p2d.xy))
+                all_px_err.append(err)
+        if all_px_err:
+            arr = _np.array(all_px_err)
+            print(f"\\nDirect self-consistency check (exported cameras, {len(arr):,} observations): "
+                  f"median={_np.median(arr):.3f}px, P90={_np.percentile(arr, 90):.3f}px, mean={arr.mean():.3f}px "
+                  f"(target: under 1px)")
+            results["self_consistency_px"] = {
+                "median": float(_np.median(arr)), "p90": float(_np.percentile(arr, 90)), "mean": float(arr.mean()),
+            }
+        else:
+            print("\\nNo points2D-with-track observations found for self-consistency check "
+                  "(likely exported with --skip_point2d, or export format differs from expected)")
+    except Exception as e:
+        import traceback
+        print(f"Failed to read exported COLMAP model: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        results["read_error"] = str(e)
+else:
+    print(f"No sparse/ output found at {sparse_dir} -- export likely failed, see STDERR above")
+
+Path(OUTPUT_DIR, "diag_step_b_colmap.json").write_text(json.dumps(results, indent=2, default=str))
+print("\\nSaved diag_step_b_colmap.json")
+'''
+
 
 def build() -> None:
     nb = nbf.v4.new_notebook()
     cells = [
         md(TITLE_MD), code(CONFIG_CELL), code(SETUP_CELL), md(CACHE_SAVE_NOTE_MD),
         code(LAUNCH_CELL), code(RESULTS_CELL), code(GROUND_TRUTH_CELL),
+        code(DIAG_STEP_A_CELL), code(DIAG_STEP_B_CELL),
     ]
 
     nb["cells"] = cells

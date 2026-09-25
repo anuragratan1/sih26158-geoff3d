@@ -636,6 +636,23 @@ class Pipeline:
         posed_keyframes = [kf for kf in keyframes if getattr(kf, "_resolved_world_pose", None) is not None]
         camera_positions = np.array([kf._resolved_world_pose for kf in posed_keyframes]) if posed_keyframes else None
 
+        # Measurement-only side effect (no new reconstruction logic): saves
+        # the exact same accepted keyframes' full-resolution images to disk,
+        # so an external tool (MapAnything's own demo_colmap.py, etc.) can
+        # be run on an identical frame set without re-implementing frame
+        # selection separately and risking drift from what this run
+        # actually used.
+        try:
+            diag_dir = self.config.output_dir / "diag_keyframes"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            from PIL import Image as _PILImage
+
+            for kf in posed_keyframes:
+                _PILImage.fromarray(kf.image_full).save(diag_dir / f"frame_{kf.frame_index:06d}.jpg", quality=95)
+            self._log(f"Saved {len(posed_keyframes)} full-resolution keyframe images to {diag_dir.name}/ for external-tool comparison")
+        except Exception as e:
+            self._log(f"Keyframe image dump for external comparison failed ({type(e).__name__}: {e}) — not fatal", level="warn")
+
         mesh_result = mesh_mod.MeshResult(mesh=None, method="none")
         bake_result = None
         try:
