@@ -60,6 +60,7 @@ class ReportBuilder:
         self.started_at = time.time()
         self.finished_at: float | None = None
         self._gpu_samples: list[tuple[float, int, float]] = []
+        self._gpu_mem_samples: list[tuple[float, int, float]] = []
         self._cpu_samples: list[tuple[float, float]] = []
         # geometric_reconstruction/large_scale_alignment/dense_point_cloud
         # run interleaved per-chunk, not as one contiguous window each — a
@@ -99,6 +100,7 @@ class ReportBuilder:
                 self._stage_elapsed_override[name] = self._stage_elapsed_override.get(name, 0.0) + p.get("seconds", 0.0)
         elif evt.type == EventType.GPU_SAMPLE:
             self._gpu_samples.append((p["ts"], p["index"], p["util_pct"]))
+            self._gpu_mem_samples.append((p["ts"], p["index"], p.get("mem_used_mb", 0.0)))
         elif evt.type == EventType.CPU_SAMPLE:
             self._cpu_samples.append((p["ts"], p["percent"]))
         elif evt.type == EventType.KEYFRAME_ACCEPTED:
@@ -168,6 +170,21 @@ class ReportBuilder:
         vals = [pct for ts, pct in self._cpu_samples if st.start_ts <= ts <= end]
         return sum(vals) / len(vals) if vals else None
 
+    def stage_peak_gpu_mem_mb(self, name: str) -> dict[int, float]:
+        """Max mem_used_mb per GPU during this stage's time window — e.g.
+        proves/disproves whether all keyframes fit one MapAnything pass
+        without OOM-halving (the halve-and-retry path is already logged
+        separately; this is the actual VRAM headroom number)."""
+        st = self.stages.get(name)
+        if st is None or st.start_ts is None:
+            return {}
+        end = st.end_ts or time.time()
+        by_gpu: dict[int, float] = {}
+        for ts, idx, mem in self._gpu_mem_samples:
+            if st.start_ts <= ts <= end:
+                by_gpu[idx] = max(by_gpu.get(idx, 0.0), mem)
+        return by_gpu
+
     def to_dict(self) -> dict:
         stages_out = []
         for name, st in self.stages.items():
@@ -178,6 +195,7 @@ class ReportBuilder:
                 "name": name, "status": st.status, "elapsed_s": elapsed,
                 "avg_gpu_util_pct": self.stage_avg_gpu_util(name),
                 "avg_cpu_util_pct": self.stage_avg_cpu_util(name),
+                "peak_gpu_mem_mb": self.stage_peak_gpu_mem_mb(name),
                 "fallback_notes": st.fallback_notes,
             })
         total_elapsed = (self.finished_at - self.started_at) if self.finished_at else None

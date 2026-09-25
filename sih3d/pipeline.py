@@ -83,7 +83,16 @@ class PipelineConfig:
     backbone_choice: str = "C"
     prior_mode: str = "AUTO"
     use_finetuned: bool = True
-    chunk_size: int = 30
+    # Bumped 30->50 for a one-shot diagnostic: with QUICK mode selecting
+    # ~41 keyframes, a chunk_size this size means _make_chunks produces
+    # exactly ONE chunk, so this run's own existing OOM-halve-and-retry
+    # logic (in _infer_chunk_backbone) directly reports whether all 41
+    # keyframes actually fit a single MapAnything pass on a T4 — if they
+    # don't, the same log line that already exists for this ("OOM on
+    # chunk N — halving to M views") says so, at no extra cost. Aspect-
+    # preserving input (~43% fewer tokens than the old square squash) is
+    # exactly what might make this newly fit where it didn't before.
+    chunk_size: int = 50
     # 6 was too few correspondence points for a well-conditioned chunk-to-
     # chunk Sim(3)/rigid fit in no-GPS mode (align_chunk_to_previous) — a
     # real run's second chunk got a badly-scattered alignment from just 6
@@ -143,7 +152,7 @@ class PreparedKeyframe:
     # instead of every call site independently rescaling kf.intrinsics (or,
     # worse, forgetting to and unprojecting a small image with full-res
     # intrinsics — see the TSDF corruption this was fixed for).
-    _intrinsics_resized_cache: tuple[int, np.ndarray] | None = field(default=None, repr=False)
+    _intrinsics_resized_cache: tuple[tuple[int, int], np.ndarray] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -185,11 +194,33 @@ def _attitude_to_cam2world(position_enu: np.ndarray, attitude_deg: tuple[float, 
     return pose
 
 
-def _resize_for_backbone(img: np.ndarray, size: int) -> np.ndarray:
+def _aspect_preserving_backbone_shape(orig_shape: tuple, long_side: int = 518, patch_size: int = 14) -> tuple[int, int]:
+    """(new_h, new_w) for MapAnything's own convention (resolution_set=518,
+    patch_size=14, per its published preprocessing) — long side = 518, the
+    short side scaled to match the real aspect ratio and rounded to the
+    nearest multiple of patch_size (both dims must be patch-size multiples
+    for its ViT backbone; 518 itself is already 37*14). Replaces the
+    non-aspect-preserving square squash (3840x2160 -> 518x518), which
+    physically discarded fine detail by squeezing 16:9 content into 1:1 and
+    was the top-priority geometry fix identified from the depth-consistency
+    diagnostics."""
+    h, w = orig_shape[:2]
+    if w >= h:
+        new_w = long_side
+        new_h = max(patch_size, int(round(h * long_side / w / patch_size)) * patch_size)
+    else:
+        new_h = long_side
+        new_w = max(patch_size, int(round(w * long_side / h / patch_size)) * patch_size)
+    return new_h, new_w
+
+
+def _resize_for_backbone(img: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
+    """shape_hw: (new_h, new_w), typically from _aspect_preserving_backbone_shape."""
     from PIL import Image
 
+    new_h, new_w = shape_hw
     pil = Image.fromarray(img)
-    pil = pil.resize((size, size), Image.BILINEAR)
+    pil = pil.resize((new_w, new_h), Image.BILINEAR)
     return np.array(pil)
 
 
@@ -853,10 +884,22 @@ class Pipeline:
         must stay strictly sequential even when inference itself runs in
         parallel across two GPUs."""
         cfg = self.config
+        # All keyframes share the source video's resolution, so the
+        # aspect-preserving target shape is the same for every one of
+        # them — computed once per chunk rather than per frame.
+        target_shape_hw = _aspect_preserving_backbone_shape(chunk_kfs[0].image_full.shape, cfg.backbone_input_size) if chunk_kfs else (cfg.backbone_input_size, cfg.backbone_input_size)
+        if not getattr(self, "_logged_backbone_shape", False):
+            self._logged_backbone_shape = True
+            orig_h, orig_w = chunk_kfs[0].image_full.shape[:2] if chunk_kfs else (0, 0)
+            new_h, new_w = target_shape_hw
+            self._log(
+                f"Backbone input: aspect-preserving {orig_w}x{orig_h} -> {new_w}x{new_h} "
+                f"(long_side={cfg.backbone_input_size}, patch_size=14) — was a {cfg.backbone_input_size}x{cfg.backbone_input_size} squash"
+            )
         views = [
             ViewInput(
-                image=_resize_for_backbone(kf.image_full, cfg.backbone_input_size),
-                intrinsics=self._resized_intrinsics(kf, cfg.backbone_input_size),
+                image=_resize_for_backbone(kf.image_full, target_shape_hw),
+                intrinsics=self._resized_intrinsics(kf, target_shape_hw),
                 camera_pose_c2w=kf.camera_pose_c2w_prior,
                 frame_index=kf.frame_index, timestamp_s=kf.timestamp_s,
             )
@@ -935,9 +978,10 @@ class Pipeline:
         eta = f", ETA {(total - done) * (elapsed / done):.0f}s" if done > 0 and done < total else ""
         return f"{done}/{total} chunks, {rate_per_min:.1f}/min{eta}"
 
-    def _scale_intrinsics(self, K: np.ndarray, orig_shape: tuple, target_size: int) -> np.ndarray:
+    def _scale_intrinsics(self, K: np.ndarray, orig_shape: tuple, target_shape_hw: tuple[int, int]) -> np.ndarray:
         h, w = orig_shape[:2]
-        sx, sy = target_size / w, target_size / h
+        new_h, new_w = target_shape_hw
+        sx, sy = new_w / w, new_h / h
         K2 = K.copy()
         K2[0, 0] *= sx
         K2[0, 2] *= sx
@@ -945,18 +989,19 @@ class Pipeline:
         K2[1, 2] *= sy
         return K2
 
-    def _resized_intrinsics(self, kf: PreparedKeyframe, target_size: int) -> np.ndarray:
+    def _resized_intrinsics(self, kf: PreparedKeyframe, target_shape_hw: tuple[int, int]) -> np.ndarray:
         """Single source of truth for "intrinsics that match the resized
         (backbone-resolution) image" — cached per keyframe so every call
         site (backbone ViewInput, TSDF unprojection) uses the exact same
         scaled matrix instead of each independently re-deriving it (or, as
         happened once, one call site forgetting to and unprojecting a
-        518x518 image with full-3840-res intrinsics)."""
+        518x518 image with full-3840-res intrinsics). target_shape_hw:
+        (new_h, new_w) — no longer assumes a square target."""
         cached = kf._intrinsics_resized_cache  # noqa: SLF001
-        if cached is not None and cached[0] == target_size:
+        if cached is not None and cached[0] == target_shape_hw:
             return cached[1]
-        K = self._scale_intrinsics(kf.intrinsics, kf.image_full.shape, target_size)
-        kf._intrinsics_resized_cache = (target_size, K)  # noqa: SLF001
+        K = self._scale_intrinsics(kf.intrinsics, kf.image_full.shape, target_shape_hw)
+        kf._intrinsics_resized_cache = (target_shape_hw, K)  # noqa: SLF001
         return K
 
     @staticmethod
@@ -1166,15 +1211,26 @@ class Pipeline:
             return
         try:
             f0 = frames[0]
-            self_check = self._warp_frame_a_onto_b(f0, f0, occlusion_px_threshold=1e9)
-            if self_check is not None:
-                z_warp, z_own, _, _ = self_check
-                self._log(
-                    f"Self-warp sanity check (frame {f0['frame_index']} onto itself, {len(z_warp):,} px): "
-                    f"median |diff|={float(np.median(np.abs(z_warp - z_own))):.4f}m "
-                    f"(should be ~0 — validates the warping math itself, independent of real cross-view data)",
-                    level="warn",
-                )
+            pts_cam_a, pose_a, intr_a = f0["pts_cam"], f0["pose"], f0["intr"]
+            valid_a = pts_cam_a[..., 2] > 0
+            rows_a, cols_a = np.nonzero(valid_a)
+            pts_a_flat = pts_cam_a[rows_a, cols_a]
+            homog = np.concatenate([pts_a_flat, np.ones((len(pts_a_flat), 1))], axis=1)
+            world = (pose_a @ homog.T).T[:, :3]
+            cam_back = (np.linalg.inv(pose_a) @ np.concatenate([world, np.ones((len(world), 1))], axis=1).T).T[:, :3]
+            fx, fy, cx, cy = intr_a[0, 0], intr_a[1, 1], intr_a[0, 2], intr_a[1, 2]
+            u_back = fx * cam_back[:, 0] / cam_back[:, 2] + cx
+            v_back = fy * cam_back[:, 1] / cam_back[:, 2] + cy
+            z_back = cam_back[:, 2]
+            px_offset = np.sqrt((u_back - cols_a) ** 2 + (v_back - rows_a) ** 2)
+            z_diff = np.abs(z_back - pts_a_flat[:, 2])
+            self._log(
+                f"Self-warp sanity check (frame {f0['frame_index']} onto itself, {len(pts_a_flat):,} px, no rounding/occlusion filtering — "
+                f"raw continuous reprojection): median pixel offset={float(np.median(px_offset)):.4f}px "
+                f"(P90={float(np.percentile(px_offset, 90)):.4f}px), median |depth diff|={float(np.median(z_diff)):.4f}m "
+                f"(all should be ~0 — validates the warping math itself, independent of any pixel-rounding or real cross-view data)",
+                level="warn",
+            )
         except Exception as e:
             self._log(f"Self-warp sanity check failed: {type(e).__name__}: {e}", level="warn")
 
@@ -1359,7 +1415,12 @@ class Pipeline:
             return
 
         points_world = alignment.apply(result.points_world)
-        colors = np.stack([_resize_for_backbone(kf.image_full, points_world.shape[1]) for kf in chunk_kfs], axis=0)
+        # points_world.shape[1:3] is (H,W) as actually produced by the
+        # backbone — deriving the resize target from it (rather than
+        # recomputing) guarantees colors always matches points_world's
+        # real shape even if it's no longer square.
+        target_shape_hw = points_world.shape[1], points_world.shape[2]
+        colors = np.stack([_resize_for_backbone(kf.image_full, target_shape_hw) for kf in chunk_kfs], axis=0)
 
         dynamic_mask = None
         if masker is not None or semantic_masker is not None:
@@ -1407,20 +1468,19 @@ class Pipeline:
                         pts_cam = pts_cam.copy()
                         pts_cam[..., 2][dynamic_mask[i]] = -1.0
                     # kf.intrinsics is full-resolution (matches kf.image_full,
-                    # e.g. 3840x2160) but view_pts/colors here are squashed to
-                    # (h, w) = (backbone_input_size, backbone_input_size) by
-                    # _resize_for_backbone above — passing the unscaled
-                    # intrinsics into a PinholeCameraIntrinsic built for this
-                    # much smaller image put the principal point (e.g.
-                    # cx~1920) far outside the actual (e.g. 518-wide) image,
-                    # scrambling every unprojected ray direction differently
-                    # per pixel. That's what tore the TSDF mesh into
-                    # incoherent, oversized triangles despite a clean point
-                    # cloud. _resized_intrinsics() is the same cached scaled
-                    # matrix _infer_chunk_backbone already computed for this
-                    # keyframe's ViewInput — one source of truth, not a
-                    # second independent rescale.
-                    intr = self._resized_intrinsics(kf, w)
+                    # e.g. 3840x2160) but view_pts/colors here are resized to
+                    # (h, w) by _resize_for_backbone above — passing the
+                    # unscaled intrinsics into a PinholeCameraIntrinsic built
+                    # for this much smaller image put the principal point
+                    # (e.g. cx~1920) far outside the actual (e.g. 518-wide)
+                    # image, scrambling every unprojected ray direction
+                    # differently per pixel. That's what tore the TSDF mesh
+                    # into incoherent, oversized triangles despite a clean
+                    # point cloud. _resized_intrinsics() is the same cached
+                    # scaled matrix _infer_chunk_backbone already computed
+                    # for this keyframe's ViewInput — one source of truth,
+                    # not a second independent rescale.
+                    intr = self._resized_intrinsics(kf, (h, w))
                     self._assert_intrinsics_match_image(intr, (h, w), label=f"TSDF unprojection, chunk {chunk_idx} frame {kf.frame_index}")
                     try:
                         # land_mask=True means "not sky/water/moving-object"
