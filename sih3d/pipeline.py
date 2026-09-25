@@ -632,7 +632,7 @@ class Pipeline:
 
         self.report.set_geometry_summary(
             georeferenced=self.georeferenced, collinearity_index=collinearity, alignment_rmse_m=alignment_rmse,
-            point_count=len(cloud.points), mesh_faces=mesh_result.n_faces,
+            point_count=len(cloud.points), mesh_faces=mesh_result.n_faces, mesh_method=mesh_result.method,
         )
 
         # -- Export ------------------------------------------------------

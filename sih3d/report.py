@@ -55,6 +55,7 @@ class ReportBuilder:
         self.rejected_keyframe_count = 0
         self.point_count = 0
         self.mesh_faces = 0
+        self.mesh_method: str | None = None
         self.outputs: list[dict] = []
         self.started_at = time.time()
         self.finished_at: float | None = None
@@ -107,19 +108,27 @@ class ReportBuilder:
 
     def set_geometry_summary(
         self, georeferenced: bool, collinearity_index: float | None, alignment_rmse_m: float | None,
-        point_count: int, mesh_faces: int,
+        point_count: int, mesh_faces: int, mesh_method: str | None = None,
     ) -> None:
         self.georeferenced = georeferenced
         self.collinearity_index = collinearity_index
         self.alignment_rmse_m = alignment_rmse_m
         self.point_count = point_count
         self.mesh_faces = mesh_faces
+        self.mesh_method = mesh_method
 
     def add_output(self, status) -> None:
         """`status`: export.ExportStatus (kept as a plain dict here to avoid
-        a circular import — export.py already knows its own shape)."""
+        a circular import — export.py already knows its own shape).
+
+        A status claiming ok=True with a 0-byte file is treated as failed
+        here too (defense in depth on top of fixing it at each export
+        function's own source) — "ok" with no actual bytes written is
+        indistinguishable from broken to anyone reading this report."""
+        ok = status.ok and (status.size_bytes > 0 or status.path is None)
+        reason = status.skipped_reason or ("wrote 0 bytes" if status.ok and not ok else None)
         self.outputs.append({
-            "name": status.name, "ok": status.ok, "skipped_reason": status.skipped_reason,
+            "name": status.name, "ok": ok, "skipped_reason": reason,
             "size_bytes": status.size_bytes, "path": str(status.path) if status.path else None,
         })
 
@@ -162,9 +171,13 @@ class ReportBuilder:
             "mode": self.mode, "backbone": self.backbone_used, "prior_mode": self.prior_mode,
             "checkpoint_source": self.checkpoint_source, "gpus": self.gpus,
             "georeferenced": self.georeferenced, "collinearity_index": self.collinearity_index,
-            "alignment_rmse_m": self.alignment_rmse_m,
+            # No GPS -> alignment is fit purely from camera-overlap
+            # correspondences in the backbone's own (unitless, arbitrary-
+            # scale) local frame, not meters — labeling it "_m" regardless
+            # implied a real physical accuracy number that isn't there.
+            "alignment_rmse_m" if self.georeferenced else "alignment_rmse_unitless": self.alignment_rmse_m,
             "keyframe_count": self.keyframe_count, "rejected_keyframe_count": self.rejected_keyframe_count,
-            "point_count": self.point_count, "mesh_faces": self.mesh_faces,
+            "point_count": self.point_count, "mesh_faces": self.mesh_faces, "mesh_method": self.mesh_method,
             "stages": stages_out, "fallbacks_triggered": self.fallbacks, "warnings": self.warnings,
             "outputs": self.outputs, "started_at": self.started_at, "finished_at": self.finished_at,
             "total_elapsed_s": total_elapsed,
@@ -209,6 +222,8 @@ class ReportBuilder:
             for o in d["outputs"]
         )
         fallback_items = "".join(f"<li class='warn'>{f}</li>" for f in d["fallbacks_triggered"]) or "<li>none</li>"
+        rmse = d.get("alignment_rmse_m", d.get("alignment_rmse_unitless"))
+        rmse_label = f"Alignment RMSE vs GPS: {rmse} m" if d['georeferenced'] else f"Alignment RMSE (no GPS — unitless, camera-overlap fit only): {rmse}"
 
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>SIH26158 Pipeline Report</title>
@@ -236,9 +251,9 @@ h1, h2 {{ font-weight: 600; }}
 <ul>
 <li>Keyframes: {d['keyframe_count']} accepted, {d['rejected_keyframe_count']} rejected</li>
 <li>Points: {d['point_count']:,}</li>
-<li>Mesh faces: {d['mesh_faces']:,}</li>
+<li>Mesh faces: {d['mesh_faces']:,} (method: {d['mesh_method']})</li>
 <li>Collinearity index: {d['collinearity_index']}</li>
-<li>Alignment RMSE vs GPS: {d['alignment_rmse_m']} m</li>
+<li>{rmse_label}</li>
 </ul>
 <h2>Outputs</h2>
 <table><tr><th>File</th><th>Status</th><th>Size</th></tr>{outputs_rows}</table>

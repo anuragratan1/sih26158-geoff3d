@@ -377,8 +377,14 @@ def export_dsm_orthomosaic(
         bus.log(f"Wrote {ortho_path.name}: {width}x{height} cells @ {cell_size_m}m")
 
     elapsed = time.time() - t0
-    dsm_status = ExportStatus(name="dsm.tif", path=dsm_path if dsm_ok else None, ok=dsm_ok, timing_s=elapsed)
-    ortho_status = ExportStatus(name="orthomosaic.tif", path=ortho_path if ortho_ok else None, ok=ortho_ok, timing_s=elapsed)
+    # ok=True with size_bytes defaulting to 0 (the dataclass default) made
+    # every successful run of this function LOOK identical to a broken one
+    # in report.json — both showed "ok": true, "size_bytes": 0. These files
+    # were never actually empty; size_bytes was just never populated.
+    dsm_size = dsm_path.stat().st_size if dsm_ok and dsm_path.exists() else 0
+    ortho_size = ortho_path.stat().st_size if ortho_ok and ortho_path.exists() else 0
+    dsm_status = ExportStatus(name="dsm.tif", path=dsm_path if dsm_ok else None, ok=dsm_ok and dsm_size > 0, size_bytes=dsm_size, timing_s=elapsed)
+    ortho_status = ExportStatus(name="orthomosaic.tif", path=ortho_path if ortho_ok else None, ok=ortho_ok and ortho_size > 0, size_bytes=ortho_size, timing_s=elapsed)
     return dsm_status, ortho_status
 
 
@@ -399,7 +405,8 @@ def export_coverage(
     if ok:
         unobserved_frac = float(np.isnan(grids["view_count"]).mean())
         bus.log(f"Wrote {path.name}: {unobserved_frac * 100:.1f}% of the bounding area unobserved")
-    return ExportStatus(name="coverage.tif", path=path if ok else None, ok=ok, timing_s=time.time() - t0)
+    size = path.stat().st_size if ok and path.exists() else 0
+    return ExportStatus(name="coverage.tif", path=path if ok else None, ok=ok and size > 0, size_bytes=size, timing_s=time.time() - t0)
 
 
 # ---------------------------------------------------------------------------
