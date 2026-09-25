@@ -208,6 +208,7 @@ class Open3DTsdfFusion:
         self.backend = "none"
         self._volume = None
         self._device_tsdf = None
+        self._logged_depth_trunc = False
         self._init()
 
     def _init(self) -> None:
@@ -263,8 +264,30 @@ class Open3DTsdfFusion:
             intr = o3d.camera.PinholeCameraIntrinsic(
                 w, h, float(intrinsics[0, 0]), float(intrinsics[1, 1]), float(intrinsics[0, 2]), float(intrinsics[1, 2])
             )
+            # depth_trunc here is RGBDImage's own "discard anything farther
+            # than this" cutoff, unrelated to sdf_trunc (which only governs
+            # the surface-crossing truncation band inside a voxel that IS
+            # within range). This used to be sdf_trunc*50 = 0.2*50 = 10m —
+            # far short of typical drone-orbit camera-to-subject distances
+            # (often 20-100m for an aerial orbit shot) — silently discarding
+            # nearly all real depth pixels as "too far", with no exception
+            # and no warning, which is exactly why every TSDF run produced
+            # an empty mesh while the intrinsics-independent point cloud
+            # (no such truncation) looked completely fine. Use max_depth_m
+            # (the actual observed depth range for this chunk) with generous
+            # headroom instead of a fixed value derived from the unrelated
+            # voxel-level parameter.
+            depth_trunc = max(float(depth[depth > 0].max()) * 1.2, self.sdf_trunc * 50) if np.any(depth > 0) else self.sdf_trunc * 50
+            if not self._logged_depth_trunc:
+                self._logged_depth_trunc = True
+                valid_frac = float((depth > 0).mean())
+                self.bus.log(
+                    f"TSDF: voxel_size={self.voxel_size:.3f}m, sdf_trunc={self.sdf_trunc:.3f}m, "
+                    f"depth_trunc={depth_trunc:.1f}m (first frame: {valid_frac * 100:.0f}% valid-depth pixels, "
+                    f"depth range {depth[depth > 0].min() if np.any(depth > 0) else 0:.1f}-{depth[depth > 0].max() if np.any(depth > 0) else 0:.1f}m)"
+                )
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                color_img, depth_img, depth_scale=1.0, depth_trunc=self.sdf_trunc * 50, convert_rgb_to_intensity=False
+                color_img, depth_img, depth_scale=1.0, depth_trunc=depth_trunc, convert_rgb_to_intensity=False
             )
             extrinsic = np.linalg.inv(camera_pose_c2w)  # world-to-camera, what Open3D's legacy API expects
             self._volume.integrate(rgbd, intr, extrinsic)
