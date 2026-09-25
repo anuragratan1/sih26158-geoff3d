@@ -1022,6 +1022,24 @@ class Pipeline:
             return mesh
 
         if i == 0:
+            # Isolates "our real depth/pose data is somehow wrong" from
+            # "TSDF integration itself is broken on this box" — a flat
+            # plane facing an identity-pose camera is about as trivially
+            # correct as synthetic input gets. If even this produces 0
+            # faces, the bug is in the Open3D/TSDF setup or API usage
+            # itself, not in anything about MapAnything's real output.
+            synth_h, synth_w = 64, 64
+            synth_depth = np.full((synth_h, synth_w), 5.0, dtype=np.float32)
+            synth_pts_cam = np.zeros((synth_h, synth_w, 3), dtype=np.float32)
+            synth_pts_cam[..., 2] = synth_depth
+            synth_color = np.full((synth_h, synth_w, 3), 128, dtype=np.uint8)
+            synth_intr = np.array([[50.0, 0, 32.0], [0, 50.0, 32.0], [0, 0, 1.0]])
+            synth_pose = np.eye(4)
+            _integrate_and_extract(
+                [(synth_pts_cam, synth_color, synth_intr, synth_pose, synth_h, synth_w, None)],
+                "SYNTHETIC sanity check: flat plane, identity pose",
+            )
+
             mesh0 = _integrate_and_extract(self._debug_tsdf_frames, "single-frame, frame 0 only")
             if mesh0 is not None and len(mesh0.triangles) > 0:
                 try:
