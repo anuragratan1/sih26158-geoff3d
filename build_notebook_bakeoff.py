@@ -412,6 +412,7 @@ try:
 
     # demo_wild.sh settings
     class _Args:
+        device = "cuda"
         keyframe_stride = 3
         win_r = 5
         max_num_register = 10
@@ -600,20 +601,26 @@ def run_one_with_smoke(script_name, backbone_key, extra_args_fn, gpu_id):
     print(json.dumps(full_status, indent=2)[:1500])
     return smoke_status, full_status
 
-def ma_args(max_frames):
-    a = [str(RESULTS_DIR / "mapanything"), str(KEYFRAMES_DIR)]
+def ma_args(out_subdir, max_frames):
+    # out_subdir passed explicitly and used for BOTH the subprocess's own
+    # --out-dir arg and launch()'s log/status directory -- a previous
+    # version hardcoded "mapanything" here regardless of whether this was
+    # the smoke or full call, so the smoke subprocess wrote its (genuinely
+    # successful) status.json to a different directory than the orchestrator
+    # read back from, misreporting a real success as "crash_no_status".
+    a = [str(RESULTS_DIR / out_subdir), str(KEYFRAMES_DIR)]
     if max_frames:
         a += ["--max_frames", str(max_frames)]
     return a
 
-def s3_args(max_frames):
-    a = [str(RESULTS_DIR / "slam3r"), str(KEYFRAMES_DIR), str(SLAM3R_REPO_DIR)]
+def s3_args(out_subdir, max_frames):
+    a = [str(RESULTS_DIR / out_subdir), str(KEYFRAMES_DIR), str(SLAM3R_REPO_DIR)]
     if max_frames:
         a += ["--max_frames", str(max_frames)]
     return a
 
-def vo_args(max_frames):
-    a = [str(RESULTS_DIR / "vggt_omega"), str(KEYFRAMES_DIR)]
+def vo_args(out_subdir, max_frames):
+    a = [str(RESULTS_DIR / out_subdir), str(KEYFRAMES_DIR)]
     if max_frames:
         a += ["--max_frames", str(max_frames)]
     return a
@@ -626,8 +633,8 @@ if PARALLEL_OK:
     # reason to pay for them sequentially.
     print("\\n=== SMOKE TESTS launched in parallel: mapanything (GPU0) + slam3r (GPU1) ===")
     t_smoke0 = time.time()
-    p_ma, d_ma, f_ma = launch("mapanything_runner.py", ma_args(4), "mapanything_smoke", 0)
-    p_s3, d_s3, f_s3 = launch("slam3r_runner.py", s3_args(4), "slam3r_smoke", 1)
+    p_ma, d_ma, f_ma = launch("mapanything_runner.py", ma_args("mapanything_smoke", 4), "mapanything_smoke", 0)
+    p_s3, d_s3, f_s3 = launch("slam3r_runner.py", s3_args("slam3r_smoke", 4), "slam3r_smoke", 1)
     to_ma = wait_with_timeout(p_ma, f_ma, SMOKE_TIMEOUT_S)
     remaining = max(1, SMOKE_TIMEOUT_S - (time.time() - t_smoke0))
     to_s3 = wait_with_timeout(p_s3, f_s3, remaining)
@@ -638,11 +645,11 @@ if PARALLEL_OK:
 
     launches = []
     if ma_smoke.get("status") == "ok":
-        launches.append(("mapanything", launch("mapanything_runner.py", ma_args(None), "mapanything", 0)))
+        launches.append(("mapanything", launch("mapanything_runner.py", ma_args("mapanything", None), "mapanything", 0)))
     else:
         results["mapanything"] = ma_smoke
     if s3_smoke.get("status") == "ok":
-        launches.append(("slam3r", launch("slam3r_runner.py", s3_args(None), "slam3r", 1)))
+        launches.append(("slam3r", launch("slam3r_runner.py", s3_args("slam3r", None), "slam3r", 1)))
     else:
         results["slam3r"] = s3_smoke
 
@@ -654,15 +661,15 @@ if PARALLEL_OK:
         results[name] = read_status(out_dir, to, name, FULL_TIMEOUT_S)
         print(f"{name}: {results[name]['status']} in {results[name].get('runtime_s', 0):.1f}s" if isinstance(results[name].get("runtime_s"), (int, float)) else f"{name}: {results[name]['status']}")
 else:
-    _, ma_full = run_one_with_smoke("mapanything_runner.py", "mapanything", ma_args, 0)
+    _, ma_full = run_one_with_smoke("mapanything_runner.py", "mapanything", lambda n: ma_args("mapanything" if n is None else "mapanything_smoke", n), 0)
     results["mapanything"] = ma_full
-    _, s3_full = run_one_with_smoke("slam3r_runner.py", "slam3r", s3_args, 0)
+    _, s3_full = run_one_with_smoke("slam3r_runner.py", "slam3r", lambda n: s3_args("slam3r" if n is None else "slam3r_smoke", n), 0)
     results["slam3r"] = s3_full
 
 print(f"\\nMapAnything + SLAM3R total wall time: {time.time() - _t0:.0f}s")
 
 if RUN_VGGT_OMEGA:
-    _, vo_full = run_one_with_smoke("vggtomega_runner.py", "vggt_omega", vo_args, 0)
+    _, vo_full = run_one_with_smoke("vggtomega_runner.py", "vggt_omega", lambda n: vo_args("vggt_omega" if n is None else "vggt_omega_smoke", n), 0)
     results["vggt_omega"] = vo_full
 else:
     results["vggt_omega"] = {"backbone": "vggt_omega", "status": "SKIPPED",
