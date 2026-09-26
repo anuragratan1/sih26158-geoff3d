@@ -413,6 +413,7 @@ try:
     # demo_wild.sh settings
     class _Args:
         device = "cuda"
+        save_all_views = False
         keyframe_stride = 3
         win_r = 5
         max_num_register = 10
