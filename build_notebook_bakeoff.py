@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Generates backbone_bakeoff.ipynb — a standalone, throwaway comparison
 notebook. Does NOT modify sih26158_geoff3d.ipynb or any sih3d/ pipeline code;
-it only *reuses* sih3d.decode/sih3d.keyframes/sih3d.io_detect (unchanged) to
-get an identical keyframe set, then runs three backbones (MapAnything,
-SLAM3R, VGGT-Omega) each in its own subprocess for a side-by-side comparison.
-No meshing/texturing/DSM. Budget: under 10 minutes wall time total on 2xT4.
+it only *reuses* sih3d.decode/sih3d.keyframes/sih3d.io_detect (unchanged,
+run in a subprocess) to get an identical keyframe set, then runs three
+backbones (MapAnything, SLAM3R, VGGT-Omega) each in its own subprocess for a
+side-by-side comparison. No meshing/texturing/DSM.
+
+GPU hygiene: the parent notebook process never imports torch or any CUDA
+library. Keyframe extraction AND every backbone run in their own subprocess,
+each pinned to a GPU via CUDA_VISIBLE_DEVICES, so GPU memory is fully
+released when each one exits.
 """
 
 from pathlib import Path
@@ -27,8 +32,9 @@ TITLE_MD = """
 # Backbone Bake-off: MapAnything vs SLAM3R vs VGGT-Omega
 
 Throwaway comparison notebook. No meshing/texturing/DSM, does not touch the
-main sih26158_geoff3d pipeline. Budget: under 10 minutes wall time total on
-2xT4, installs included.
+main sih26158_geoff3d pipeline. Parent process never imports torch/CUDA;
+keyframe extraction and every backbone run in their own subprocess, pinned
+to a GPU, so GPU memory is actually released between runs.
 """
 
 SETUP_CELL = r'''
@@ -37,7 +43,6 @@ import os, sys, subprocess, time, json
 from pathlib import Path
 
 _t_setup0 = time.time()
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 CODE_DIR = Path("/kaggle/working/sih26158-geoff3d")
 REPO_URL = "https://github.com/anuragratan1/sih26158-geoff3d.git"
@@ -45,101 +50,193 @@ if CODE_DIR.exists():
     subprocess.run(["git", "-C", str(CODE_DIR), "pull", "--ff-only"], capture_output=True, text=True, timeout=60)
 else:
     subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(CODE_DIR)], check=True, capture_output=True, text=True, timeout=180)
-sys.path.insert(0, str(CODE_DIR))
+sys.path.insert(0, str(CODE_DIR))  # only used by the KEYFRAMES subprocess, not this parent process
 
 BAKEOFF_DIR = Path("/kaggle/working/bakeoff")
 SCRIPTS_DIR = BAKEOFF_DIR / "scripts"
 KEYFRAMES_DIR = Path("/kaggle/working/keyframes")
 RESULTS_DIR = BAKEOFF_DIR / "results"
+SLAM3R_REPO_DIR = BAKEOFF_DIR / "SLAM3R"
 for d in (BAKEOFF_DIR, SCRIPTS_DIR, KEYFRAMES_DIR, RESULTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 install_log = {}
 
-def _pip(args, label, timeout=180):
+def _run(cmd, label, timeout=180):
     t0 = time.time()
-    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + args, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     elapsed = time.time() - t0
     ok = r.returncode == 0
     print(f"  [{'OK' if ok else 'FAILED'} {elapsed:.0f}s] {label}")
     if not ok:
-        print("   ", r.stderr[-400:])
+        print("   ", (r.stderr or r.stdout)[-500:])
     install_log[label] = {"ok": ok, "elapsed_s": elapsed}
     return ok
 
-print("== Installs ==")
+def _pip(args, label, timeout=180):
+    return _run([sys.executable, "-m", "pip", "install", "-q"] + args, label, timeout)
+
+print("== GPU inventory (before any install) ==")
+_run(["nvidia-smi", "-L"], "nvidia-smi -L (informational)", timeout=30)
+subprocess.run(["nvidia-smi", "-L"], timeout=30)  # print output for the log
+subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv"], timeout=30)
+
+print("\\n== Installs ==")
 _t_installs0 = time.time()
 
 # MapAnything (Apache) -- plain pip install, matches main pipeline's own choice.
 _pip(["git+https://github.com/facebookresearch/map-anything.git"], "mapanything")
 
-# SLAM3R -- --no-deps then only the light deps actually needed for the
-# offline recon.py path (skip pycuda/viser/gradio/tensorboard/pyglet: demo/
-# viz-only, and per explicit instruction skip xformers + custom RoPE kernel
-# compile).
-_pip(["--no-deps", "git+https://github.com/PKU-VCL-3DV/SLAM3R.git"], "slam3r (no-deps)")
-_pip(["roma", "einops", "opencv-python-headless", "scipy", "huggingface-hub[torch]>=0.22"], "slam3r light deps")
+# SLAM3R is NOT pip-installable (no setup.py/pyproject.toml in the repo at
+# all -- confirmed by inspection). git clone it and run from its own
+# directory via sys.path, per explicit instruction. Its requirements.txt has
+# no torch pin (checked directly), so nothing to strip there; skip the
+# heavy/optional demo-only deps (pycuda, viser, gradio, tensorboard, pyglet)
+# and the optional xformers/custom RoPE kernel compile entirely -- pure
+# PyTorch fallback only.
+if not SLAM3R_REPO_DIR.exists():
+    _run(["git", "clone", "--depth", "1", "https://github.com/PKU-VCL-3DV/SLAM3R.git", str(SLAM3R_REPO_DIR)],
+         "slam3r (git clone)", timeout=60)
+_pip(["roma", "einops", "opencv-python-headless", "scipy", "trimesh", "huggingface-hub[torch]>=0.22"],
+     "slam3r deps (no pycuda/viser/gradio/tensorboard/pyglet)")
 
 elapsed_installs_so_far = time.time() - _t_installs0
-print(f"Installs so far: {elapsed_installs_so_far:.0f}s")
+print(f"Installs so far (mapanything + slam3r): {elapsed_installs_so_far:.0f}s")
 
-RUN_VGGT_OMEGA = os.environ.get("HF_TOKEN") not in (None, "")
-if RUN_VGGT_OMEGA and elapsed_installs_so_far > 150:
-    print(f"Install budget (180s) at risk after mapanything+slam3r ({elapsed_installs_so_far:.0f}s) -- dropping VGGT-Omega per budget rule.")
+# -- VGGT-Omega: check gated access BEFORE installing anything for it -------
+HF_TOKEN = os.environ.get("HF_TOKEN")
+vggt_access = {"checked": False, "status": None, "detail": None}
+if not HF_TOKEN:
+    vggt_access = {"checked": True, "status": "no_token", "detail": "HF_TOKEN not set in this kernel's environment"}
+else:
+    _check = subprocess.run(
+        [sys.executable, "-c", (
+            "import os, sys, json\n"
+            "from huggingface_hub import hf_hub_download\n"
+            "from huggingface_hub.utils import HfHubHTTPError\n"
+            "try:\n"
+            "    p = hf_hub_download(repo_id='facebook/VGGT-Omega', filename='vggt_omega_1b_512.pt', token=os.environ.get('HF_TOKEN'))\n"
+            "    print(json.dumps({'status': 'success', 'path': p}))\n"
+            "except HfHubHTTPError as e:\n"
+            "    code = e.response.status_code if e.response is not None else None\n"
+            "    print(json.dumps({'status': f'http_{code}', 'detail': str(e)}))\n"
+            "except Exception as e:\n"
+            "    print(json.dumps({'status': 'other_error', 'detail': f'{type(e).__name__}: {e}'}))\n"
+        )],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "HF_TOKEN": HF_TOKEN},
+    )
+    try:
+        vggt_access = {"checked": True, **json.loads(_check.stdout.strip().splitlines()[-1])}
+    except Exception:
+        vggt_access = {"checked": True, "status": "check_failed", "detail": (_check.stderr or _check.stdout)[-500:]}
+
+print(f"\\nVGGT-Omega access check: {json.dumps(vggt_access)}")
+RUN_VGGT_OMEGA = vggt_access.get("status") == "success"
+if not RUN_VGGT_OMEGA:
+    print(f"VGGT-Omega will be SKIPPED: {vggt_access}")
+elif elapsed_installs_so_far > 150:
+    print(f"Install budget at risk ({elapsed_installs_so_far:.0f}s already) -- dropping VGGT-Omega per budget rule despite access working.")
     RUN_VGGT_OMEGA = False
-elif not RUN_VGGT_OMEGA:
-    print("HF_TOKEN not set -- VGGT-Omega will be SKIPPED (gated checkpoint).")
-
-if RUN_VGGT_OMEGA:
+else:
     _pip(["git+https://github.com/facebookresearch/vggt-omega.git"], "vggt-omega")
 
+(RESULTS_DIR / "install_log.json").write_text(json.dumps({"install_log": install_log, "vggt_access": vggt_access, "run_vggt_omega": RUN_VGGT_OMEGA}, indent=2))
 print(f"\\nTotal install time: {time.time() - _t_installs0:.0f}s")
 print(f"Setup cell total: {time.time() - _t_setup0:.0f}s")
 '''
 
+GPU_HELPERS = r'''
+def log_gpu_state(label):
+    """GPU hygiene check, per explicit instruction: log nvidia-smi -L and
+    per-GPU memory.used before each backbone launch, in the PARENT process
+    (which never imports torch/CUDA itself, so any memory shown here was
+    left behind by a subprocess that didn't clean up, not by us)."""
+    import subprocess
+    print(f"\\n-- GPU state: {label} --")
+    subprocess.run(["nvidia-smi", "-L"], timeout=15)
+    r = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=15)
+    print(r.stdout.strip())
+    rows = [l.split(",") for l in r.stdout.strip().splitlines() if l.strip()]
+    mem_by_gpu = {int(idx.strip()): float(mem.strip()) for idx, mem in rows}
+    n_gpus = len(mem_by_gpu)
+    return n_gpus, mem_by_gpu
+'''
+
 KEYFRAMES_CELL = r'''
-# ============================== KEYFRAMES (shared by all backbones) =========
+# ============================== KEYFRAMES (own subprocess, GPU hygiene) =====
+# Runs in its OWN subprocess so its GPU decode context (torchcodec/NVDEC) is
+# fully released when it exits -- the parent process here never imports
+# torch/CUDA at all, which is what left ~6.9GB resident and caused
+# MapAnything's OOM in the previous run (decode ran inline in this same
+# long-lived kernel process, its CUDA context never went away).
 import json
+import subprocess
 import sys
 import time
+''' + GPU_HELPERS + r'''
+
+_t0 = time.time()
+log_gpu_state("before keyframe extraction")
+
+keyframes_script = SCRIPTS_DIR / "keyframes_runner.py"
+r = subprocess.run([sys.executable, str(keyframes_script), str(KEYFRAMES_DIR), str(CODE_DIR)],
+                    capture_output=True, text=True, timeout=90)
+print(r.stdout[-3000:])
+if r.returncode != 0:
+    print("KEYFRAMES FAILED:")
+    print(r.stderr[-3000:])
+else:
+    manifest = json.loads((KEYFRAMES_DIR / "manifest.json").read_text())
+    print(f"\\n{len(manifest['keyframes'])} keyframes ready in {time.time() - _t0:.1f}s")
+
+log_gpu_state("after keyframe extraction (should be back near 0 on all GPUs)")
+'''
+
+WRITE_SCRIPTS_CELL = r'''
+# ============================== WRITE RUNNER SCRIPTS ==========================
+# Each runner is a standalone subprocess: never raises past its own top-level
+# try/except -- a bug, missing access, or OOM becomes a recorded status, not
+# a crash that takes down the orchestrator. Each accepts an optional
+# --max_frames for the 4-frame smoke test before the full 41-frame run.
 from pathlib import Path
 
+KEYFRAMES_RUNNER = r"""
+import json, sys, time
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, str(CODE_DIR))
-_t0 = time.time()
+out_dir, code_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, code_dir)
+t0 = time.time()
 
 from sih3d.decode import FrameDecoder
 from sih3d.events import EventBus
 from sih3d.io_detect import find_videos
 from sih3d.keyframes import select_keyframes
+from pathlib import Path as _P
 
 bus = EventBus()
-videos = find_videos(Path("/kaggle/input"))
+videos = find_videos(_P("/kaggle/input"))
 if not videos:
     raise RuntimeError("No video found under /kaggle/input")
 video = videos[0]
 print(f"Video: {video.path.name} | {video.width}x{video.height} | {video.fps:.1f} fps | {video.duration_s:.1f}s")
 
 decoder = FrameDecoder(video.path, bus, device="cuda:0")
-
-# Full resolution (no scale_width) -- the bake-off explicitly wants
-# full-resolution JPGs, unlike the main pipeline's own working-resolution
-# decode used only for its own sharpness pre-pass.
 QUICK_SECONDS = 90.0
-KEYFRAME_SAMPLE_FPS = 4.0
 MAX_KEYFRAMES = 60
 
 raw_indices, raw_ts, raw_frames = [], [], []
-for idx, t, frame in decoder.iter_frames(start_s=0.0, end_s=min(QUICK_SECONDS, video.duration_s), target_fps=KEYFRAME_SAMPLE_FPS):
+for idx, t, frame in decoder.iter_frames(start_s=0.0, end_s=min(QUICK_SECONDS, video.duration_s), target_fps=4.0):
     raw_indices.append(idx)
     raw_ts.append(t)
     raw_frames.append(frame)
     if len(raw_frames) >= MAX_KEYFRAMES * 4:
         break
 
-print(f"Decoded {len(raw_frames)} candidate frames in {time.time() - _t0:.1f}s")
+print(f"Decoded {len(raw_frames)} candidate frames in {time.time() - t0:.1f}s")
 
 selection = select_keyframes(raw_indices, raw_ts, raw_frames, None, bus, device="cuda:0")
 accepted = selection.accepted
@@ -148,44 +245,42 @@ if len(accepted) > MAX_KEYFRAMES:
     accepted = [accepted[int(i * step)] for i in range(MAX_KEYFRAMES)]
 
 manifest = []
+out_p = _P(out_dir)
 for cand in accepted:
     local_i = raw_indices.index(cand.frame_index)
     img = raw_frames[local_i]
     fn = f"frame_{cand.frame_index:06d}.jpg"
-    Image.fromarray(img).save(KEYFRAMES_DIR / fn, quality=95)
+    Image.fromarray(img).save(out_p / fn, quality=95)
     manifest.append({"frame_index": cand.frame_index, "timestamp_s": cand.timestamp_s, "file": fn,
                       "width": int(img.shape[1]), "height": int(img.shape[0])})
 
-(KEYFRAMES_DIR / "manifest.json").write_text(json.dumps({
+(out_p / "manifest.json").write_text(json.dumps({
     "video": str(video.path), "video_width": video.width, "video_height": video.height,
     "video_fps": video.fps, "keyframes": manifest,
 }, indent=2))
-
-print(f"Saved {len(manifest)} full-resolution keyframes to {KEYFRAMES_DIR} in {time.time() - _t0:.1f}s total")
-'''
-
-WRITE_SCRIPTS_CELL = r'''
-# ============================== WRITE BACKBONE RUNNER SCRIPTS ================
-# Each runner is a standalone subprocess: loads the shared keyframes, runs
-# its own model, writes a result JSON/NPZ, and NEVER raises past its own
-# top-level try/except -- a bug or OOM becomes a recorded status, not a
-# crash that takes down the orchestrator.
-from pathlib import Path
+print(f"Saved {len(manifest)} full-resolution keyframes to {out_dir} in {time.time() - t0:.1f}s total")
+"""
 
 MAPANYTHING_RUNNER = r"""
-import json, os, sys, time, traceback
+import argparse, json, os, sys, time, traceback
 import numpy as np
 import torch
 
+parser = argparse.ArgumentParser()
+parser.add_argument("out_dir")
+parser.add_argument("keyframes_dir")
+parser.add_argument("--max_frames", type=int, default=None)
+args = parser.parse_args()
+
 status = {"backbone": "mapanything", "status": "error", "runtime_s": None, "peak_vram_mb": None, "frames": 0}
-out_dir = sys.argv[1]
-keyframes_dir = sys.argv[2]
-os.makedirs(out_dir, exist_ok=True)
+os.makedirs(args.out_dir, exist_ok=True)
 t0 = time.time()
 try:
     torch.cuda.reset_peak_memory_stats()
-    manifest = json.load(open(os.path.join(keyframes_dir, "manifest.json")))
-    image_paths = [os.path.join(keyframes_dir, k["file"]) for k in manifest["keyframes"]]
+    manifest = json.load(open(os.path.join(args.keyframes_dir, "manifest.json")))
+    image_paths = [os.path.join(args.keyframes_dir, k["file"]) for k in manifest["keyframes"]]
+    if args.max_frames:
+        image_paths = image_paths[:args.max_frames]
 
     from mapanything.models import MapAnything
     from mapanything.utils.image import load_images
@@ -203,7 +298,7 @@ try:
     if "intrinsics" in outputs[0]:
         intrinsics = np.stack([o["intrinsics"][0].float().cpu().numpy() for o in outputs], axis=0)
 
-    np.savez(os.path.join(out_dir, "result.npz"), points=points, conf=conf, poses=poses,
+    np.savez(os.path.join(args.out_dir, "result.npz"), points=points, conf=conf, poses=poses,
              intrinsics=intrinsics if intrinsics is not None else np.zeros((len(outputs), 3, 3)))
     status["status"] = "ok"
     status["frames"] = len(outputs)
@@ -217,24 +312,40 @@ finally:
         status["peak_vram_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
     except Exception:
         pass
-    json.dump(status, open(os.path.join(out_dir, "status.json"), "w"), indent=2)
+    json.dump(status, open(os.path.join(args.out_dir, "status.json"), "w"), indent=2)
     print(json.dumps(status, indent=2))
 """
 
 SLAM3R_RUNNER = r"""
-import json, os, sys, time, traceback
+import argparse, json, os, sys, time, traceback
 import numpy as np
 import torch
 
+parser = argparse.ArgumentParser()
+parser.add_argument("out_dir")
+parser.add_argument("keyframes_dir")
+parser.add_argument("slam3r_repo_dir")
+parser.add_argument("--max_frames", type=int, default=None)
+args = parser.parse_args()
+sys.path.insert(0, args.slam3r_repo_dir)  # SLAM3R has no setup.py -- run from its own checkout via sys.path
+
 status = {"backbone": "slam3r", "status": "error", "runtime_s": None, "peak_vram_mb": None, "frames": 0,
           "has_cameras": False}
-out_dir = sys.argv[1]
-keyframes_dir = sys.argv[2]
-os.makedirs(out_dir, exist_ok=True)
+os.makedirs(args.out_dir, exist_ok=True)
 t0 = time.time()
 try:
     torch.cuda.reset_peak_memory_stats()
-    manifest = json.load(open(os.path.join(keyframes_dir, "manifest.json")))
+
+    # Smoke-test subset: copy the first N keyframes into their own dir, since
+    # Seq_Data reads a whole directory rather than an explicit file list.
+    manifest = json.load(open(os.path.join(args.keyframes_dir, "manifest.json")))
+    img_dir = args.keyframes_dir
+    if args.max_frames and args.max_frames < len(manifest["keyframes"]):
+        import shutil
+        img_dir = os.path.join(args.out_dir, "_smoke_input")
+        os.makedirs(img_dir, exist_ok=True)
+        for k in manifest["keyframes"][:args.max_frames]:
+            shutil.copy(os.path.join(args.keyframes_dir, k["file"]), os.path.join(img_dir, k["file"]))
 
     from slam3r.models import Image2PointsModel, Local2WorldModel
     from slam3r.datasets.wild_seq import Seq_Data
@@ -244,11 +355,12 @@ try:
     i2p_model = Image2PointsModel.from_pretrained("siyan824/slam3r_i2p").to(device).eval()
     l2w_model = Local2WorldModel.from_pretrained("siyan824/slam3r_l2w").to(device).eval()
 
-    dataset = Seq_Data(img_dir=keyframes_dir, img_size=224, silent=False, sample_freq=1,
+    dataset = Seq_Data(img_dir=img_dir, img_size=224, silent=False, sample_freq=1,
                         start_idx=0, num_views=-1, start_freq=1, to_tensor=True)
     if hasattr(dataset, "set_epoch"):
         dataset.set_epoch(0)
 
+    # demo_wild.sh settings
     class _Args:
         keyframe_stride = 3
         win_r = 5
@@ -273,11 +385,10 @@ try:
         save_online = False
         perframe = 1
 
-    scene_recon_pipeline_offline(i2p_model, l2w_model, dataset, _Args(), out_dir)
+    scene_recon_pipeline_offline(i2p_model, l2w_model, dataset, _Args(), args.out_dir)
 
-    preds_dir = os.path.join(out_dir, "preds")
+    preds_dir = os.path.join(args.out_dir, "preds")
     pcds = np.load(os.path.join(preds_dir, "registered_pcds.npy"))
-    confs = np.load(os.path.join(preds_dir, "registered_confs.npy"))
     status["status"] = "ok"
     status["frames"] = int(pcds.shape[0])
     status["has_cameras"] = False  # SLAM3R produces no camera poses/intrinsics
@@ -290,24 +401,30 @@ finally:
         status["peak_vram_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
     except Exception:
         pass
-    json.dump(status, open(os.path.join(out_dir, "status.json"), "w"), indent=2)
+    json.dump(status, open(os.path.join(args.out_dir, "status.json"), "w"), indent=2)
     print(json.dumps(status, indent=2))
 """
 
 VGGT_OMEGA_RUNNER = r"""
-import json, os, sys, time, traceback
+import argparse, json, os, sys, time, traceback
 import numpy as np
 import torch
 
+parser = argparse.ArgumentParser()
+parser.add_argument("out_dir")
+parser.add_argument("keyframes_dir")
+parser.add_argument("--max_frames", type=int, default=None)
+args = parser.parse_args()
+
 status = {"backbone": "vggt_omega", "status": "error", "runtime_s": None, "peak_vram_mb": None, "frames": 0}
-out_dir = sys.argv[1]
-keyframes_dir = sys.argv[2]
-os.makedirs(out_dir, exist_ok=True)
+os.makedirs(args.out_dir, exist_ok=True)
 t0 = time.time()
 try:
     torch.cuda.reset_peak_memory_stats()
-    manifest = json.load(open(os.path.join(keyframes_dir, "manifest.json")))
-    image_paths = [os.path.join(keyframes_dir, k["file"]) for k in manifest["keyframes"]]
+    manifest = json.load(open(os.path.join(args.keyframes_dir, "manifest.json")))
+    image_paths = [os.path.join(args.keyframes_dir, k["file"]) for k in manifest["keyframes"]]
+    if args.max_frames:
+        image_paths = image_paths[:args.max_frames]
 
     from huggingface_hub import hf_hub_download
     ckpt_path = hf_hub_download(repo_id="facebook/VGGT-Omega", filename="vggt_omega_1b_512.pt",
@@ -331,7 +448,7 @@ try:
     depth = predictions["depth"].float().cpu().numpy()
     depth_conf = predictions["depth_conf"].float().cpu().numpy()
 
-    np.savez(os.path.join(out_dir, "result.npz"), depth=depth, depth_conf=depth_conf,
+    np.savez(os.path.join(args.out_dir, "result.npz"), depth=depth, depth_conf=depth_conf,
              extrinsics=extrinsics.float().cpu().numpy(), intrinsics=intrinsics.float().cpu().numpy())
     status["status"] = "ok"
     status["frames"] = int(depth.shape[1]) if depth.ndim > 1 else int(depth.shape[0])
@@ -344,10 +461,11 @@ finally:
         status["peak_vram_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
     except Exception:
         pass
-    json.dump(status, open(os.path.join(out_dir, "status.json"), "w"), indent=2)
+    json.dump(status, open(os.path.join(args.out_dir, "status.json"), "w"), indent=2)
     print(json.dumps(status, indent=2))
 """
 
+(SCRIPTS_DIR / "keyframes_runner.py").write_text(KEYFRAMES_RUNNER)
 (SCRIPTS_DIR / "mapanything_runner.py").write_text(MAPANYTHING_RUNNER)
 (SCRIPTS_DIR / "slam3r_runner.py").write_text(SLAM3R_RUNNER)
 (SCRIPTS_DIR / "vggtomega_runner.py").write_text(VGGT_OMEGA_RUNNER)
@@ -355,28 +473,31 @@ print("Runner scripts written:", [p.name for p in SCRIPTS_DIR.glob("*.py")])
 '''
 
 RUN_BACKBONES_CELL = r'''
-# ============================== RUN BACKBONES (subprocess, parallel where possible)
+# ============================== RUN BACKBONES (smoke test -> full run) ======
 import json
+import os
 import subprocess
 import sys
 import time
-from pathlib import Path
+''' + GPU_HELPERS + r'''
 
-TIMEOUT_S = 150
+SMOKE_TIMEOUT_S = 60
+FULL_TIMEOUT_S = 150
 _t0 = time.time()
 
-def launch(script_name, out_subdir, gpu_id, env_extra=None):
+n_gpus, mem_by_gpu = log_gpu_state("before any backbone")
+PARALLEL_OK = n_gpus >= 2 and all(m < 500 for m in mem_by_gpu.values())
+print(f"\\nn_gpus={n_gpus}, mem_by_gpu={mem_by_gpu} -> {'PARALLEL (2 GPU)' if PARALLEL_OK else 'SEQUENTIAL (assert failed or <2 GPUs)'}")
+
+def launch(script_name, extra_args, out_subdir, gpu_id):
     out_dir = RESULTS_DIR / out_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
-    env = dict(**__import__("os").environ)
+    env = dict(**os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    if env_extra:
-        env.update(env_extra)
     log_path = out_dir / "log.txt"
     log_f = open(log_path, "w")
     proc = subprocess.Popen(
-        [sys.executable, str(SCRIPTS_DIR / script_name), str(out_dir), str(KEYFRAMES_DIR)],
-        stdout=log_f, stderr=subprocess.STDOUT, env=env,
+        [sys.executable, str(SCRIPTS_DIR / script_name)] + extra_args, stdout=log_f, stderr=subprocess.STDOUT, env=env,
     )
     return proc, out_dir, log_f
 
@@ -391,58 +512,101 @@ def wait_with_timeout(proc, log_f, timeout_s):
     log_f.close()
     return timed_out
 
-results = {}
-
-# MapAnything on GPU0, SLAM3R on GPU1, launched together.
-print("Launching MapAnything (GPU0) + SLAM3R (GPU1) in parallel...")
-p_ma, dir_ma, log_ma = launch("mapanything_runner.py", "mapanything", 0)
-p_s3, dir_s3, log_s3 = launch("slam3r_runner.py", "slam3r", 1)
-
-t_ma0 = time.time()
-timed_out_ma = wait_with_timeout(p_ma, log_ma, TIMEOUT_S)
-elapsed_ma = time.time() - t_ma0
-t_s3_remaining = max(1, TIMEOUT_S - (time.time() - t_ma0))
-timed_out_s3 = wait_with_timeout(p_s3, log_s3, t_s3_remaining)
-
-for name, out_dir, timed_out, elapsed_wall in [
-    ("mapanything", dir_ma, timed_out_ma, elapsed_ma),
-    ("slam3r", dir_s3, timed_out_s3, None),
-]:
+def read_status(out_dir, timed_out, name, timeout_s):
     status_path = out_dir / "status.json"
     if timed_out:
-        results[name] = {"backbone": name, "status": "timeout", "runtime_s": TIMEOUT_S}
-        print(f"{name}: TIMEOUT after {TIMEOUT_S}s")
-    elif status_path.exists():
-        results[name] = json.loads(status_path.read_text())
-        print(f"{name}: {results[name]['status']} in {results[name].get('runtime_s', 0):.1f}s")
-    else:
-        log_text = (out_dir / "log.txt").read_text()[-1000:] if (out_dir / "log.txt").exists() else ""
-        results[name] = {"backbone": name, "status": "crash_no_status", "log_tail": log_text}
-        print(f"{name}: CRASHED with no status.json -- log tail:\\n{log_text}")
+        return {"backbone": name, "status": "timeout", "runtime_s": timeout_s}
+    if status_path.exists():
+        return json.loads(status_path.read_text())
+    log_text = (out_dir / "log.txt").read_text()[-1500:] if (out_dir / "log.txt").exists() else ""
+    return {"backbone": name, "status": "crash_no_status", "log_tail": log_text}
 
-print(f"\\nMapAnything + SLAM3R wall time: {time.time() - _t0:.0f}s")
+def run_one_with_smoke(script_name, backbone_key, extra_args_fn, gpu_id):
+    print(f"\\n=== {backbone_key}: SMOKE TEST (4 frames, GPU{gpu_id}) ===")
+    p, d, f = launch(script_name, extra_args_fn(4), f"{backbone_key}_smoke", gpu_id)
+    timed_out = wait_with_timeout(p, f, SMOKE_TIMEOUT_S)
+    smoke_status = read_status(d, timed_out, backbone_key, SMOKE_TIMEOUT_S)
+    print(json.dumps(smoke_status, indent=2)[:1000])
+    if smoke_status.get("status") != "ok":
+        print(f"{backbone_key}: SMOKE TEST FAILED -- skipping full run")
+        return smoke_status, smoke_status
+    print(f"\\n=== {backbone_key}: FULL RUN (all keyframes, GPU{gpu_id}) ===")
+    p, d, f = launch(script_name, extra_args_fn(None), backbone_key, gpu_id)
+    timed_out = wait_with_timeout(p, f, FULL_TIMEOUT_S)
+    full_status = read_status(d, timed_out, backbone_key, FULL_TIMEOUT_S)
+    print(json.dumps(full_status, indent=2)[:1500])
+    return smoke_status, full_status
+
+def ma_args(max_frames):
+    a = [str(RESULTS_DIR / "mapanything"), str(KEYFRAMES_DIR)]
+    if max_frames:
+        a += ["--max_frames", str(max_frames)]
+    return a
+
+def s3_args(max_frames):
+    a = [str(RESULTS_DIR / "slam3r"), str(KEYFRAMES_DIR), str(SLAM3R_REPO_DIR)]
+    if max_frames:
+        a += ["--max_frames", str(max_frames)]
+    return a
+
+def vo_args(max_frames):
+    a = [str(RESULTS_DIR / "vggt_omega"), str(KEYFRAMES_DIR)]
+    if max_frames:
+        a += ["--max_frames", str(max_frames)]
+    return a
+
+results = {}
+
+if PARALLEL_OK:
+    # Smoke tests run sequentially regardless (cheap, avoids double-launch
+    # complexity); only the FULL runs go parallel across the 2 GPUs.
+    print("\\n=== mapanything: SMOKE TEST (4 frames, GPU0) ===")
+    p, d, f = launch("mapanything_runner.py", ma_args(4), "mapanything_smoke", 0)
+    to = wait_with_timeout(p, f, SMOKE_TIMEOUT_S)
+    ma_smoke = read_status(d, to, "mapanything", SMOKE_TIMEOUT_S)
+    print(json.dumps(ma_smoke, indent=2)[:1000])
+
+    print("\\n=== slam3r: SMOKE TEST (4 frames, GPU1) ===")
+    p, d, f = launch("slam3r_runner.py", s3_args(4), "slam3r_smoke", 1)
+    to = wait_with_timeout(p, f, SMOKE_TIMEOUT_S)
+    s3_smoke = read_status(d, to, "slam3r", SMOKE_TIMEOUT_S)
+    print(json.dumps(s3_smoke, indent=2)[:1000])
+
+    launches = []
+    if ma_smoke.get("status") == "ok":
+        launches.append(("mapanything", launch("mapanything_runner.py", ma_args(None), "mapanything", 0)))
+    else:
+        results["mapanything"] = ma_smoke
+    if s3_smoke.get("status") == "ok":
+        launches.append(("slam3r", launch("slam3r_runner.py", s3_args(None), "slam3r", 1)))
+    else:
+        results["slam3r"] = s3_smoke
+
+    print(f"\\n=== FULL RUNS launched in parallel: {[n for n, _ in launches]} ===")
+    t_full0 = time.time()
+    for name, (proc, out_dir, log_f) in launches:
+        remaining = max(1, FULL_TIMEOUT_S - (time.time() - t_full0))
+        to = wait_with_timeout(proc, log_f, remaining)
+        results[name] = read_status(out_dir, to, name, FULL_TIMEOUT_S)
+        print(f"{name}: {results[name]['status']} in {results[name].get('runtime_s', 0):.1f}s" if isinstance(results[name].get("runtime_s"), (int, float)) else f"{name}: {results[name]['status']}")
+else:
+    _, ma_full = run_one_with_smoke("mapanything_runner.py", "mapanything", ma_args, 0)
+    results["mapanything"] = ma_full
+    _, s3_full = run_one_with_smoke("slam3r_runner.py", "slam3r", s3_args, 0)
+    results["slam3r"] = s3_full
+
+print(f"\\nMapAnything + SLAM3R total wall time: {time.time() - _t0:.0f}s")
 
 if RUN_VGGT_OMEGA:
-    print("\\nLaunching VGGT-Omega (GPU0)...")
-    p_vo, dir_vo, log_vo = launch("vggtomega_runner.py", "vggt_omega", 0, env_extra={"HF_TOKEN": __import__("os").environ.get("HF_TOKEN", "")})
-    timed_out_vo = wait_with_timeout(p_vo, log_vo, TIMEOUT_S)
-    status_path = dir_vo / "status.json"
-    if timed_out_vo:
-        results["vggt_omega"] = {"backbone": "vggt_omega", "status": "timeout", "runtime_s": TIMEOUT_S}
-        print(f"vggt_omega: TIMEOUT after {TIMEOUT_S}s")
-    elif status_path.exists():
-        results["vggt_omega"] = json.loads(status_path.read_text())
-        print(f"vggt_omega: {results['vggt_omega']['status']} in {results['vggt_omega'].get('runtime_s', 0):.1f}s")
-    else:
-        log_text = (dir_vo / "log.txt").read_text()[-1000:] if (dir_vo / "log.txt").exists() else ""
-        results["vggt_omega"] = {"backbone": "vggt_omega", "status": "crash_no_status", "log_tail": log_text}
-        print(f"vggt_omega: CRASHED with no status.json -- log tail:\\n{log_text}")
+    _, vo_full = run_one_with_smoke("vggtomega_runner.py", "vggt_omega", vo_args, 0)
+    results["vggt_omega"] = vo_full
 else:
-    results["vggt_omega"] = {"backbone": "vggt_omega", "status": "SKIPPED", "reason": "HF_TOKEN not set or install budget exceeded"}
-    print("vggt_omega: SKIPPED")
+    results["vggt_omega"] = {"backbone": "vggt_omega", "status": "SKIPPED",
+                              "reason": json.loads((RESULTS_DIR / "install_log.json").read_text()).get("vggt_access")}
+    print("vggt_omega: SKIPPED --", results["vggt_omega"]["reason"])
 
-(RESULTS_DIR / "all_status.json").write_text(json.dumps(results, indent=2))
-print(f"\\nTotal backbone runtime: {time.time() - _t0:.0f}s")
+(RESULTS_DIR / "all_status.json").write_text(json.dumps(results, indent=2, default=str))
+print(f"\\nTotal backbone stage: {time.time() - _t0:.0f}s")
 '''
 
 METRICS_CELL = r'''
@@ -469,9 +633,6 @@ table_rows = []
 
 
 def self_warp_error(points, intrinsics, poses):
-    """Median/P90 pixel offset reprojecting each pixel's own 3D point
-    through its own recorded camera -- validates the (points, camera)
-    pair are mutually consistent. points: (N,H,W,3) world frame."""
     errs = []
     for i in range(min(3, len(points))):
         pts = points[i]
@@ -499,8 +660,8 @@ def self_warp_error(points, intrinsics, poses):
 
 
 def cross_view_consistency(points, intrinsics, poses):
-    """Land-masking SKIPPED for the 1-minute metrics time budget -- this is
-    ALL valid-depth pixels, not land-only. Reported honestly as such."""
+    """Land-masking SKIPPED for the metrics time budget -- ALL valid-depth
+    pixels, not land-only. Reported honestly as such."""
     abs_d, rel_d = [], []
     n = min(len(points), 10)
     for i in range(n - 1):
@@ -536,11 +697,7 @@ def cross_view_consistency(points, intrinsics, poses):
 
 
 def fit_sim3_to_mapanything(pts_model, pts_ref, grid_n=32):
-    """Resamples both per-frame point grids to a common grid_n x grid_n
-    (normalized image coords, nearest) and fits Sim(3) model->ref via
-    solve_sim3. Returns (scale, median_residual_pct_of_depth) or (None, None)."""
-    residuals = []
-    scales = []
+    residuals, scales = [], []
     for i in range(min(3, len(pts_model), len(pts_ref))):
         hm, wm = pts_model[i].shape[:2]
         hr, wr = pts_ref[i].shape[:2]
@@ -571,7 +728,6 @@ def fit_sim3_to_mapanything(pts_model, pts_ref, grid_n=32):
     return float(np.median(scales)), float(np.median(residuals))
 
 
-# -- MapAnything (reference) --------------------------------------------------
 ma_status = all_status.get("mapanything", {})
 ma_points = ma_intr = ma_poses = None
 if ma_status.get("status") == "ok":
@@ -588,7 +744,6 @@ else:
     table_rows.append({"backbone": "mapanything", "status": ma_status.get("status", "missing"),
                         "error": ma_status.get("error")})
 
-# -- SLAM3R --------------------------------------------------------------------
 s3_status = all_status.get("slam3r", {})
 if s3_status.get("status") == "ok":
     pcds = np.load(RESULTS_DIR / "slam3r" / "preds" / "registered_pcds.npy")
@@ -605,18 +760,13 @@ else:
     table_rows.append({"backbone": "slam3r", "status": s3_status.get("status", "missing"),
                         "error": s3_status.get("error")})
 
-# -- VGGT-Omega ------------------------------------------------------------
 vo_status = all_status.get("vggt_omega", {})
+vo_points = None
 if vo_status.get("status") == "ok":
     d = np.load(RESULTS_DIR / "vggt_omega" / "result.npz")
     depth, extr, intr_vo = d["depth"], d["extrinsics"], d["intrinsics"]
-    # depth (1,N,H,W,1) or (N,H,W,1)-ish depending on vggt_omega's exact
-    # output layout -- unproject to camera-space points, squeeze leading dims defensively.
     depth = np.squeeze(depth)
-    if depth.ndim == 3:
-        n_f, h, w = depth.shape
-    else:
-        n_f, h, w = depth.shape[0], depth.shape[-2], depth.shape[-1]
+    n_f, h, w = (depth.shape if depth.ndim == 3 else (depth.shape[0], depth.shape[-2], depth.shape[-1]))
     ys, xs = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
     vo_points = np.zeros((n_f, h, w, 3), dtype=np.float32)
     vo_poses = np.zeros((n_f, 4, 4), dtype=np.float32)
@@ -645,7 +795,7 @@ if vo_status.get("status") == "ok":
     table_rows.append(row)
 else:
     table_rows.append({"backbone": "vggt_omega", "status": vo_status.get("status", "missing"),
-                        "error": vo_status.get("error")})
+                        "error": vo_status.get("error"), "reason": vo_status.get("reason")})
 
 print("\\n=== METRICS TABLE ===")
 for row in table_rows:
@@ -653,7 +803,6 @@ for row in table_rows:
 
 (RESULTS_DIR / "metrics_table.json").write_text(json.dumps(table_rows, indent=2, default=str))
 
-# -- Renders: frames 0, 390, 996 (closest available keyframe by frame_index) --
 render_targets = [0, 390, 996]
 for target in render_targets:
     closest_idx = min(range(len(frame_indices)), key=lambda i: abs(frame_indices[i] - target))
@@ -663,15 +812,13 @@ for target in render_targets:
     axes[0].set_title(f"Real photo (frame {frame_indices[closest_idx]})")
     axes[0].axis("off")
 
-    panels = [("mapanything", ma_points), ("slam3r", None), ("vggt_omega", None)]
+    panels = [("mapanything", ma_points), ("slam3r", None), ("vggt_omega", vo_points)]
     if s3_status.get("status") == "ok":
         try:
             pcds = np.load(RESULTS_DIR / "slam3r" / "preds" / "registered_pcds.npy")
-            panels[1] = ("slam3r", pcds if closest_idx < len(pcds) else None)
+            panels[1] = ("slam3r", pcds)
         except Exception:
             pass
-    if vo_status.get("status") == "ok" and "vo_points" in dir():
-        panels[2] = ("vggt_omega", vo_points if closest_idx < len(vo_points) else None)
 
     for ax, (name, pts) in zip(axes[1:], panels):
         if pts is None or closest_idx >= len(pts):
@@ -683,7 +830,7 @@ for target in render_targets:
         p = p[valid]
         if len(p) > 50_000:
             p = p[np.random.default_rng(0).choice(len(p), 50_000, replace=False)]
-        order = np.argsort(-p[:, 2])  # far first, near last (crude z-buffer)
+        order = np.argsort(-p[:, 2])
         p = p[order]
         ax.scatter(p[:, 0], -p[:, 1], s=0.3, c=p[:, 2], cmap="viridis")
         ax.set_title(name)
@@ -704,8 +851,8 @@ def build() -> None:
     nb["cells"] = [
         md(TITLE_MD),
         code(SETUP_CELL),
-        code(KEYFRAMES_CELL),
         code(WRITE_SCRIPTS_CELL),
+        code(KEYFRAMES_CELL),
         code(RUN_BACKBONES_CELL),
         code(METRICS_CELL),
     ]
