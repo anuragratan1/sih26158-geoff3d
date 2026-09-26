@@ -60,6 +60,20 @@ SLAM3R_REPO_DIR = BAKEOFF_DIR / "SLAM3R"
 for d in (BAKEOFF_DIR, SCRIPTS_DIR, KEYFRAMES_DIR, RESULTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+# Kaggle Secrets are NOT auto-injected as plain OS env vars -- they must be
+# read via kaggle_secrets.UserSecretsClient explicitly. The previous run's
+# "HF_TOKEN not set" was this, not a missing/unattached secret. Once read,
+# inject it into os.environ so every subprocess launched below (which
+# inherit os.environ) sees it as a normal env var without needing
+# kaggle_secrets itself (not guaranteed available off the Kaggle platform).
+try:
+    from kaggle_secrets import UserSecretsClient
+    _hf_token = UserSecretsClient().get_secret("HF_TOKEN")
+    os.environ["HF_TOKEN"] = _hf_token
+    print(f"HF_TOKEN loaded from Kaggle Secrets ({len(_hf_token)} chars)")
+except Exception as e:
+    print(f"Could not load HF_TOKEN from Kaggle Secrets ({type(e).__name__}: {e}) -- falling back to os.environ, likely empty")
+
 install_log = {}
 
 def _run(cmd, label, timeout=180):
@@ -102,6 +116,26 @@ _pip(["roma", "einops", "opencv-python-headless", "scipy", "trimesh", "huggingfa
 
 elapsed_installs_so_far = time.time() - _t_installs0
 print(f"Installs so far (mapanything + slam3r): {elapsed_installs_so_far:.0f}s")
+
+# -- Prefetch model weights in the BACKGROUND now, overlapping with the rest
+# of setup + keyframe extraction (~45s), instead of paying for a cold
+# huggingface_hub download inside the 60s smoke-test timeout -- that (plus
+# unauthenticated-request rate limiting, now fixed by the HF_TOKEN load
+# above) is exactly what made both the mapanything and slam3r smoke tests
+# time out on the previous, brand-new kernel with nothing cached yet.
+_prefetch_procs = []
+_prefetch_code = (
+    "from huggingface_hub import snapshot_download\n"
+    "import sys\n"
+    "snapshot_download(sys.argv[1])\n"
+    "print('prefetched', sys.argv[1])\n"
+)
+(SCRIPTS_DIR / "_prefetch.py").write_text(_prefetch_code)
+for repo_id in ["facebook/map-anything-apache", "siyan824/slam3r_i2p", "siyan824/slam3r_l2w"]:
+    p = subprocess.Popen([sys.executable, str(SCRIPTS_DIR / "_prefetch.py"), repo_id],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(**os.environ))
+    _prefetch_procs.append((repo_id, p))
+print(f"Launched {len(_prefetch_procs)} background weight-prefetch downloads (will finish overlapping with keyframe extraction)")
 
 # -- VGGT-Omega: check gated access BEFORE installing anything for it -------
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -481,9 +515,22 @@ import sys
 import time
 ''' + GPU_HELPERS + r'''
 
-SMOKE_TIMEOUT_S = 60
+SMOKE_TIMEOUT_S = 90
 FULL_TIMEOUT_S = 150
 _t0 = time.time()
+
+# Wait for the background weight-prefetch downloads launched during Setup --
+# they've already had the full keyframe-extraction duration to run
+# overlapped; this just closes the remaining gap so the smoke test's own
+# timeout only has to cover actual inference, not a cold HF download.
+print("Waiting for background weight prefetch to finish (already overlapped with keyframe extraction)...")
+for repo_id, p in _prefetch_procs:
+    try:
+        p.wait(timeout=90)
+        print(f"  prefetch done: {repo_id}")
+    except subprocess.TimeoutExpired:
+        p.kill()
+        print(f"  prefetch still not done after waiting, proceeding anyway (smoke test will eat the rest of the download): {repo_id}")
 
 n_gpus, mem_by_gpu = log_gpu_state("before any backbone")
 PARALLEL_OK = n_gpus >= 2 and all(m < 500 for m in mem_by_gpu.values())
@@ -558,18 +605,19 @@ def vo_args(max_frames):
 results = {}
 
 if PARALLEL_OK:
-    # Smoke tests run sequentially regardless (cheap, avoids double-launch
-    # complexity); only the FULL runs go parallel across the 2 GPUs.
-    print("\\n=== mapanything: SMOKE TEST (4 frames, GPU0) ===")
-    p, d, f = launch("mapanything_runner.py", ma_args(4), "mapanything_smoke", 0)
-    to = wait_with_timeout(p, f, SMOKE_TIMEOUT_S)
-    ma_smoke = read_status(d, to, "mapanything", SMOKE_TIMEOUT_S)
+    # Both smoke tests launched together (GPU0/GPU1) -- with weights now
+    # prefetched, each is just a quick real inference check, so there's no
+    # reason to pay for them sequentially.
+    print("\\n=== SMOKE TESTS launched in parallel: mapanything (GPU0) + slam3r (GPU1) ===")
+    t_smoke0 = time.time()
+    p_ma, d_ma, f_ma = launch("mapanything_runner.py", ma_args(4), "mapanything_smoke", 0)
+    p_s3, d_s3, f_s3 = launch("slam3r_runner.py", s3_args(4), "slam3r_smoke", 1)
+    to_ma = wait_with_timeout(p_ma, f_ma, SMOKE_TIMEOUT_S)
+    remaining = max(1, SMOKE_TIMEOUT_S - (time.time() - t_smoke0))
+    to_s3 = wait_with_timeout(p_s3, f_s3, remaining)
+    ma_smoke = read_status(d_ma, to_ma, "mapanything", SMOKE_TIMEOUT_S)
+    s3_smoke = read_status(d_s3, to_s3, "slam3r", SMOKE_TIMEOUT_S)
     print(json.dumps(ma_smoke, indent=2)[:1000])
-
-    print("\\n=== slam3r: SMOKE TEST (4 frames, GPU1) ===")
-    p, d, f = launch("slam3r_runner.py", s3_args(4), "slam3r_smoke", 1)
-    to = wait_with_timeout(p, f, SMOKE_TIMEOUT_S)
-    s3_smoke = read_status(d, to, "slam3r", SMOKE_TIMEOUT_S)
     print(json.dumps(s3_smoke, indent=2)[:1000])
 
     launches = []
