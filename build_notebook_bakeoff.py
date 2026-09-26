@@ -405,8 +405,17 @@ try:
     i2p_model = Image2PointsModel.from_pretrained("siyan824/slam3r_i2p").to(device).eval()
     l2w_model = Local2WorldModel.from_pretrained("siyan824/slam3r_l2w").to(device).eval()
 
+    # postfix=".jpg" is required, not optional, when img_dir is the SHARED
+    # keyframes directory (the full run doesn't get its own clean copy like
+    # the smoke test does): slam3r.utils.image.load_images sorts every file
+    # in the directory by scanning backward from the extension for a
+    # trailing number BEFORE it ever filters by image extension -- manifest.json
+    # sits in that same directory, has no digits before its extension, and
+    # that scan produces an empty string that float() then rejects
+    # (ValueError: could not convert string to float: ''). Passing postfix
+    # here filters to real images first, before that sort ever runs.
     dataset = Seq_Data(img_dir=img_dir, img_size=224, silent=False, sample_freq=1,
-                        start_idx=0, num_views=-1, start_freq=1, to_tensor=True)
+                        start_idx=0, num_views=-1, start_freq=1, to_tensor=True, postfix=".jpg")
     if hasattr(dataset, "set_epoch"):
         dataset.set_epoch(0)
 
