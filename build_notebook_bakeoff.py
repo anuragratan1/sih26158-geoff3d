@@ -214,16 +214,32 @@ import time
 _t0 = time.time()
 log_gpu_state("before keyframe extraction")
 
+# Cold subprocess import of torch/torchcodec/cv2 etc. plus concurrent
+# network+disk contention from the background weight-prefetch downloads
+# (launched during Setup, still running) made this take longer than inline
+# extraction did in earlier runs -- a bare subprocess.run(timeout=...) that
+# actually fires raises TimeoutExpired uncaught, which crashed the entire
+# notebook via papermill last run. Bumped the timeout and wrapped it so a
+# timeout is a reported, recoverable failure instead of a hard crash.
 keyframes_script = SCRIPTS_DIR / "keyframes_runner.py"
-r = subprocess.run([sys.executable, str(keyframes_script), str(KEYFRAMES_DIR), str(CODE_DIR)],
-                    capture_output=True, text=True, timeout=90)
-print(r.stdout[-3000:])
-if r.returncode != 0:
-    print("KEYFRAMES FAILED:")
-    print(r.stderr[-3000:])
-else:
-    manifest = json.loads((KEYFRAMES_DIR / "manifest.json").read_text())
-    print(f"\\n{len(manifest['keyframes'])} keyframes ready in {time.time() - _t0:.1f}s")
+keyframes_ok = False
+try:
+    r = subprocess.run([sys.executable, str(keyframes_script), str(KEYFRAMES_DIR), str(CODE_DIR)],
+                        capture_output=True, text=True, timeout=150)
+    print(r.stdout[-3000:])
+    if r.returncode != 0:
+        print("KEYFRAMES FAILED:")
+        print(r.stderr[-3000:])
+    else:
+        manifest = json.loads((KEYFRAMES_DIR / "manifest.json").read_text())
+        print(f"\\n{len(manifest['keyframes'])} keyframes ready in {time.time() - _t0:.1f}s")
+        keyframes_ok = True
+except subprocess.TimeoutExpired as e:
+    print(f"KEYFRAMES TIMED OUT after 150s (partial stdout follows):")
+    print((e.stdout or b"").decode(errors="replace")[-2000:] if isinstance(e.stdout, bytes) else (e.stdout or "")[-2000:])
+
+if not keyframes_ok:
+    print("\\n*** No keyframes available -- all backbone runs below will be skipped. ***")
 
 log_gpu_state("after keyframe extraction (should be back near 0 on all GPUs)")
 '''
@@ -673,9 +689,18 @@ sys.path.insert(0, str(CODE_DIR))
 from sih3d.align import solve_sim3
 
 _t0 = time.time()
-manifest = json.load(open(KEYFRAMES_DIR / "manifest.json"))["keyframes"]
+# A raised exception here (even SystemExit) is captured by papermill as a
+# cell error and fails the whole notebook run -- so a missing manifest
+# (keyframe extraction failed earlier) degrades to an empty manifest and a
+# clear printed message instead, exactly like every backbone runner script
+# already degrades to a recorded status instead of crashing.
+if (KEYFRAMES_DIR / "manifest.json").exists():
+    manifest = json.load(open(KEYFRAMES_DIR / "manifest.json"))["keyframes"]
+else:
+    print("No keyframes manifest found -- keyframe extraction failed earlier in this run. Nothing to measure or render.")
+    manifest = []
 frame_indices = [k["frame_index"] for k in manifest]
-all_status = json.loads((RESULTS_DIR / "all_status.json").read_text())
+all_status = json.loads((RESULTS_DIR / "all_status.json").read_text()) if (RESULTS_DIR / "all_status.json").exists() else {}
 
 table_rows = []
 
@@ -851,7 +876,7 @@ for row in table_rows:
 
 (RESULTS_DIR / "metrics_table.json").write_text(json.dumps(table_rows, indent=2, default=str))
 
-render_targets = [0, 390, 996]
+render_targets = [0, 390, 996] if frame_indices else []
 for target in render_targets:
     closest_idx = min(range(len(frame_indices)), key=lambda i: abs(frame_indices[i] - target))
     real_img_path = KEYFRAMES_DIR / manifest[closest_idx]["file"]
