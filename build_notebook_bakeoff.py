@@ -534,6 +534,11 @@ import time
 
 SMOKE_TIMEOUT_S = 90
 FULL_TIMEOUT_S = 150
+# 4 frames < SLAM3R's own initial_winsize=5 (demo_wild default), which
+# recon_offline_pipeline asserts against directly -- SLAM3R's own smoke
+# test can never pass with fewer than 5 frames regardless of anything else.
+# 6 gives it a little headroom.
+SMOKE_FRAMES = 6
 _t0 = time.time()
 
 # Wait for the background weight-prefetch downloads launched during Setup --
@@ -586,8 +591,8 @@ def read_status(out_dir, timed_out, name, timeout_s):
     return {"backbone": name, "status": "crash_no_status", "log_tail": log_text}
 
 def run_one_with_smoke(script_name, backbone_key, extra_args_fn, gpu_id):
-    print(f"\\n=== {backbone_key}: SMOKE TEST (4 frames, GPU{gpu_id}) ===")
-    p, d, f = launch(script_name, extra_args_fn(4), f"{backbone_key}_smoke", gpu_id)
+    print(f"\\n=== {backbone_key}: SMOKE TEST ({SMOKE_FRAMES} frames, GPU{gpu_id}) ===")
+    p, d, f = launch(script_name, extra_args_fn(SMOKE_FRAMES), f"{backbone_key}_smoke", gpu_id)
     timed_out = wait_with_timeout(p, f, SMOKE_TIMEOUT_S)
     smoke_status = read_status(d, timed_out, backbone_key, SMOKE_TIMEOUT_S)
     print(json.dumps(smoke_status, indent=2)[:1000])
@@ -633,8 +638,8 @@ if PARALLEL_OK:
     # reason to pay for them sequentially.
     print("\\n=== SMOKE TESTS launched in parallel: mapanything (GPU0) + slam3r (GPU1) ===")
     t_smoke0 = time.time()
-    p_ma, d_ma, f_ma = launch("mapanything_runner.py", ma_args("mapanything_smoke", 4), "mapanything_smoke", 0)
-    p_s3, d_s3, f_s3 = launch("slam3r_runner.py", s3_args("slam3r_smoke", 4), "slam3r_smoke", 1)
+    p_ma, d_ma, f_ma = launch("mapanything_runner.py", ma_args("mapanything_smoke", SMOKE_FRAMES), "mapanything_smoke", 0)
+    p_s3, d_s3, f_s3 = launch("slam3r_runner.py", s3_args("slam3r_smoke", SMOKE_FRAMES), "slam3r_smoke", 1)
     to_ma = wait_with_timeout(p_ma, f_ma, SMOKE_TIMEOUT_S)
     remaining = max(1, SMOKE_TIMEOUT_S - (time.time() - t_smoke0))
     to_s3 = wait_with_timeout(p_s3, f_s3, remaining)
